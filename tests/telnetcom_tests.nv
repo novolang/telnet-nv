@@ -1,0 +1,411 @@
+// telnetcom_tests.nv — a serial port over Telnet, RFC 2217.
+//
+// The subnegotiations are `IAC SB 44 code value IAC SE`, with IAC 255 (FF),
+// SB 250 (FA), the option 44 (2C) and SE 240 (F0).  The client's codes are
+// below 100 and the server answers with the code plus 100:
+//
+//     SET-BAUDRATE 115200       FF FA 2C 01 00 01 C2 00 FF F0
+//         the answer            FF FA 2C 65 00 01 C2 00 FF F0
+//     SET-DATASIZE 7            FF FA 2C 02 07 FF F0
+//         the answer            FF FA 2C 66 07 FF F0
+//     SET-PARITY EVEN (3)       FF FA 2C 03 03 FF F0      answer code 67 (0x67)
+//     SET-STOPSIZE 2            FF FA 2C 04 02 FF F0      answer code 68
+//     SET-CONTROL 8 (DTR on)    FF FA 2C 05 08 FF F0      answer code 69
+//     NOTIFY-MODEMSTATE 0x11    FF FA 2C 6B 11 FF F0
+//
+// 115200 is 0x0001C200.  A value of 255 would be doubled; none of the values
+// here is, and the test of the 16-bit and 8-bit values at 255 is in
+// `telnetwire_tests.nv`.
+
+use std.list
+use std.test
+use telnetcom
+use telnetsess
+use telnetwire
+
+// The bytes of a buffer as a list.
+fn list_of(var out: telnetwire.TelBuf) -> [Int]
+    var xs: [Int] = []
+    for i in 0..out.len()
+        list.push(xs, out[i] as Int)
+    xs
+
+// A received subnegotiation from a list of bytes.
+fn sub_of(xs: [Int]) -> telnetwire.TelSb
+    var sub: telnetwire.TelSb = Vec.new()
+    for x in xs
+        let _ = sub.push(x as u8)
+    sub
+
+// A server takes a request and answers: the change mask and the reply bytes.
+fn serve(var port: telnetcom.ComPort, xs: [Int]) -> [Int]
+    var sub = sub_of(xs)
+    var out: telnetwire.TelBuf = Vec.new()
+    let chg = telnetcom.com_handle(var port, var sub, var out)
+    list.concat([chg], list_of(var out))
+
+@test
+fn test_the_defaults() [io]
+    let p = telnetcom.com_new()
+    test.assert_eq(p.baud, 9600)
+    test.assert_eq(p.datasize, 8)
+    test.assert_eq(p.parity, telnetcom.COM_PARITY_NONE)
+    test.assert_eq(p.stopsize, 1)
+    test.assert_eq(p.flow, 1)
+    test.assert_eq(p.inflow, 14)
+    test.assert_eq(p.brk, false)
+    test.assert_eq(p.dtr, true)
+    test.assert_eq(p.rts, true)
+    test.assert_eq(p.ls_mask, 0)
+    test.assert_eq(p.ms_mask, 255)
+    test.assert_eq(p.suspended, false)
+
+@test
+fn test_the_codes() [io]
+    test.assert_eq(telnetcom.COM_SIGNATURE, 0)
+    test.assert_eq(telnetcom.COM_SET_BAUDRATE, 1)
+    test.assert_eq(telnetcom.COM_SET_DATASIZE, 2)
+    test.assert_eq(telnetcom.COM_SET_PARITY, 3)
+    test.assert_eq(telnetcom.COM_SET_STOPSIZE, 4)
+    test.assert_eq(telnetcom.COM_SET_CONTROL, 5)
+    test.assert_eq(telnetcom.COM_NOTIFY_LINESTATE, 6)
+    test.assert_eq(telnetcom.COM_NOTIFY_MODEMSTATE, 7)
+    test.assert_eq(telnetcom.COM_FLOW_SUSPEND, 8)
+    test.assert_eq(telnetcom.COM_FLOW_RESUME, 9)
+    test.assert_eq(telnetcom.COM_SET_LINESTATE_MASK, 10)
+    test.assert_eq(telnetcom.COM_SET_MODEMSTATE_MASK, 11)
+    test.assert_eq(telnetcom.COM_PURGE_DATA, 12)
+    test.assert_eq(telnetcom.COM_REPLY, 100)
+
+// ── The client's requests ──────────────────────────────────────────
+
+@test
+fn test_the_requests_are_built_as_the_rfc_shows() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetcom.com_set_baud(var out, 115200), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x2C, 0x01, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0])
+    var b: telnetwire.TelBuf = Vec.new()
+    let _ = telnetcom.com_set_datasize(var b, 7)
+    let _ = telnetcom.com_set_parity(var b, telnetcom.COM_PARITY_EVEN)
+    let _ = telnetcom.com_set_stopsize(var b, 2)
+    let _ = telnetcom.com_set_control(var b, 8)
+    test.assert_eq(list_of(var b),
+                   [0xFF, 0xFA, 0x2C, 0x02, 0x07, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x03, 0x03, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x04, 0x02, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x05, 0x08, 0xFF, 0xF0])
+    var c: telnetwire.TelBuf = Vec.new()
+    let _ = telnetcom.com_set_linestate_mask(var c, 0x0F)
+    let _ = telnetcom.com_set_modemstate_mask(var c, 0xF0)
+    let _ = telnetcom.com_purge(var c, 3)
+    let _ = telnetcom.com_suspend(var c, true)
+    let _ = telnetcom.com_suspend(var c, false)
+    let _ = telnetcom.com_ask_signature(var c)
+    test.assert_eq(list_of(var c),
+                   [0xFF, 0xFA, 0x2C, 0x0A, 0x0F, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x0B, 0xF0, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x0C, 0x03, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x08, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x09, 0xFF, 0xF0,
+                    0xFF, 0xFA, 0x2C, 0x00, 0xFF, 0xF0])
+
+@test
+fn test_a_value_of_255_is_doubled_in_a_request() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetcom.com_set_modemstate_mask(var out, 0xFF), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x2C, 0x0B, 0xFF, 0xFF, 0xFF, 0xF0])
+
+@test
+fn test_a_request_that_does_not_fit_is_not_written() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - 7
+        let _ = out.push(0x55)
+    test.assert_eq(telnetcom.com_set_baud(var out, 115200), false)
+    test.assert_eq(out.len(), telnetwire.TEL_BUF_MAX - 7)
+    test.assert_eq(telnetcom.com_set_datasize(var out, 8), true)
+    test.assert_eq(out.len(), telnetwire.TEL_BUF_MAX)
+
+// ── The server ─────────────────────────────────────────────────────
+
+@test
+fn test_set_baud_changes_the_port_and_is_answered_with_the_rate_in_force() [io]
+    var port = telnetcom.com_new()
+    let r = serve(var port, [0x01, 0x00, 0x01, 0xC2, 0x00])
+    test.assert_eq(r, [telnetcom.COM_CHG_BAUD, 0xFF, 0xFA, 0x2C, 0x65, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0])
+    test.assert_eq(port.baud, 115200)
+
+@test
+fn test_a_baud_of_zero_asks_for_the_rate_and_changes_nothing() [io]
+    var port = telnetcom.com_new()
+    let r = serve(var port, [0x01, 0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(r, [0, 0xFF, 0xFA, 0x2C, 0x65, 0x00, 0x00, 0x25, 0x80, 0xFF, 0xF0])
+    test.assert_eq(port.baud, 9600)
+
+@test
+fn test_the_same_baud_again_is_answered_and_is_not_a_change() [io]
+    var port = telnetcom.com_new()
+    let r = serve(var port, [0x01, 0x00, 0x00, 0x25, 0x80])
+    test.assert_eq(r[0], 0)
+    test.assert_eq(list.len(r), 11)
+
+@test
+fn test_set_datasize_parity_and_stopsize() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, [0x02, 0x07]),
+        [telnetcom.COM_CHG_DATASIZE, 0xFF, 0xFA, 0x2C, 0x66, 0x07, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x03, 0x03]),
+        [telnetcom.COM_CHG_PARITY, 0xFF, 0xFA, 0x2C, 0x67, 0x03, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x04, 0x02]),
+        [telnetcom.COM_CHG_STOPSIZE, 0xFF, 0xFA, 0x2C, 0x68, 0x02, 0xFF, 0xF0])
+    test.assert_eq(port.datasize, 7)
+    test.assert_eq(port.parity, 3)
+    test.assert_eq(port.stopsize, 2)
+
+@test
+fn test_a_value_out_of_range_or_zero_changes_nothing_and_the_answer_is_the_value_in_force() [io]
+    var port = telnetcom.com_new()
+    // 0 asks; 9 and 4 are outside the data sizes; 9 and 4 are outside parity
+    // values 1 to 5 only for 9; stop 4 is outside 1 to 3.
+    test.assert_eq(serve(var port, [0x02, 0x00]), [0, 0xFF, 0xFA, 0x2C, 0x66, 0x08, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x02, 0x09]), [0, 0xFF, 0xFA, 0x2C, 0x66, 0x08, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x03, 0x09]), [0, 0xFF, 0xFA, 0x2C, 0x67, 0x01, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x04, 0x04]), [0, 0xFF, 0xFA, 0x2C, 0x68, 0x01, 0xFF, 0xF0])
+    test.assert_eq(port.datasize, 8)
+
+@test
+fn test_set_control_sets_the_flow_the_break_dtr_and_rts() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, [0x05, 0x03]),
+        [telnetcom.COM_CHG_FLOW, 0xFF, 0xFA, 0x2C, 0x69, 0x03, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x05]),
+        [telnetcom.COM_CHG_BREAK, 0xFF, 0xFA, 0x2C, 0x69, 0x05, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x06]),
+        [telnetcom.COM_CHG_BREAK, 0xFF, 0xFA, 0x2C, 0x69, 0x06, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x09]),
+        [telnetcom.COM_CHG_DTR, 0xFF, 0xFA, 0x2C, 0x69, 0x09, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x08]),
+        [telnetcom.COM_CHG_DTR, 0xFF, 0xFA, 0x2C, 0x69, 0x08, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x0C]),
+        [telnetcom.COM_CHG_RTS, 0xFF, 0xFA, 0x2C, 0x69, 0x0C, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x0B]),
+        [telnetcom.COM_CHG_RTS, 0xFF, 0xFA, 0x2C, 0x69, 0x0B, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x0F]),
+        [telnetcom.COM_CHG_INFLOW, 0xFF, 0xFA, 0x2C, 0x69, 0x0F, 0xFF, 0xF0])
+    test.assert_eq(port.flow, 3)
+    test.assert_eq(port.inflow, 15)
+    test.assert_eq(port.brk, false)
+    test.assert_eq(port.dtr, true)
+    test.assert_eq(port.rts, true)
+
+@test
+fn test_set_control_requests_answer_the_state_and_change_nothing() [io]
+    var port = telnetcom.com_new()
+    // 4 asks the break state (off: 6), 7 DTR (on: 8), 10 RTS (on: 11), 13 the
+    // input flow control (none: 14).
+    test.assert_eq(serve(var port, [0x05, 0x04]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x06, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x07]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x08, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x0A]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x0B, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x05, 0x0D]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x0E, 0xFF, 0xF0])
+    // A value the port does not know is answered with the output flow control.
+    test.assert_eq(serve(var port, [0x05, 0x63]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x01, 0xFF, 0xF0])
+    // And the break state after it was set.
+    let _ = serve(var port, [0x05, 0x05])
+    test.assert_eq(serve(var port, [0x05, 0x04]), [0, 0xFF, 0xFA, 0x2C, 0x69, 0x05, 0xFF, 0xF0])
+
+@test
+fn test_the_masks_are_set_and_answered() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, [0x0A, 0x0F]),
+        [telnetcom.COM_CHG_STATE, 0xFF, 0xFA, 0x2C, 0x6E, 0x0F, 0xFF, 0xF0])
+    test.assert_eq(serve(var port, [0x0B, 0xF0]),
+        [telnetcom.COM_CHG_STATE, 0xFF, 0xFA, 0x2C, 0x6F, 0xF0, 0xFF, 0xF0])
+    test.assert_eq(port.ls_mask, 0x0F)
+    test.assert_eq(port.ms_mask, 0xF0)
+
+@test
+fn test_purge_names_the_buffers_and_an_unknown_one_is_ignored() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, [0x0C, 0x02]),
+        [telnetcom.COM_CHG_PURGE, 0xFF, 0xFA, 0x2C, 0x70, 0x02, 0xFF, 0xF0])
+    test.assert_eq(port.purge, 2)
+    test.assert_eq(serve(var port, [0x0C, 0x00]), [0])
+    test.assert_eq(serve(var port, [0x0C, 0x04]), [0])
+    test.assert_eq(port.purge, 2)
+
+@test
+fn test_suspend_and_resume_have_no_answer() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, [0x08]), [telnetcom.COM_CHG_SUSPEND])
+    test.assert_eq(port.suspended, true)
+    test.assert_eq(serve(var port, [0x09]), [telnetcom.COM_CHG_SUSPEND])
+    test.assert_eq(port.suspended, false)
+
+@test
+fn test_the_signature_is_answered_with_a_name() [io]
+    var port = telnetcom.com_new()
+    let r = serve(var port, [0x00])
+    // FF FA 2C 64 "telnet-nv" FF F0
+    test.assert_eq(r[0], 0)
+    test.assert_eq(r[4], 0x64)
+    test.assert_eq(r[5], 0x74)
+    test.assert_eq(list.len(r), 1 + 4 + 9 + 2)
+
+@test
+fn test_a_signature_that_does_not_fit_is_not_written() [io]
+    var port = telnetcom.com_new()
+    var sub = sub_of([0x00])
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - 8
+        let _ = out.push(0x55)
+    test.assert_eq(telnetcom.com_handle(var port, var sub, var out), 0)
+    test.assert_eq(out.len(), telnetwire.TEL_BUF_MAX - 8)
+
+@test
+fn test_short_empty_and_unknown_requests_do_nothing() [io]
+    var port = telnetcom.com_new()
+    test.assert_eq(serve(var port, []), [0])
+    test.assert_eq(serve(var port, [0x01, 0x00, 0x01]), [0])
+    test.assert_eq(serve(var port, [0x02]), [0])
+    test.assert_eq(serve(var port, [0x03]), [0])
+    test.assert_eq(serve(var port, [0x04]), [0])
+    test.assert_eq(serve(var port, [0x05]), [0])
+    test.assert_eq(serve(var port, [0x0A]), [0])
+    test.assert_eq(serve(var port, [0x0B]), [0])
+    test.assert_eq(serve(var port, [0x0C]), [0])
+    test.assert_eq(serve(var port, [0x63, 0x01]), [0])
+    test.assert_eq(port.baud, 9600)
+
+// ── Notifications from the server ──────────────────────────────────
+
+@test
+fn test_a_modem_state_in_the_mask_is_notified() [io]
+    var port = telnetcom.com_new()
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetcom.com_notify_modemstate(var port, 0x11, var out), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x2C, 0x6B, 0x11, 0xFF, 0xF0])
+    test.assert_eq(port.modemstate, 0x11)
+
+@test
+fn test_a_state_outside_the_mask_is_remembered_and_not_sent() [io]
+    var port = telnetcom.com_new()
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetcom.com_notify_linestate(var port, 0x08, var out), false)
+    test.assert_eq(port.linestate, 0x08)
+    let _ = serve(var port, [0x0A, 0x08])
+    test.assert_eq(telnetcom.com_notify_linestate(var port, 0x08, var out), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x2C, 0x6A, 0x08, 0xFF, 0xF0])
+    let _ = serve(var port, [0x0B, 0x00])
+    var quiet: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetcom.com_notify_modemstate(var port, 0xF1, var quiet), false)
+    test.assert_eq(quiet.len(), 0)
+
+// ── The client's mirror ────────────────────────────────────────────
+
+@test
+fn test_a_client_takes_the_servers_answers_into_its_mirror() [io]
+    var mirror = telnetcom.com_new()
+    test.assert_eq(serve(var mirror, [0x65, 0x00, 0x01, 0xC2, 0x00]), [telnetcom.COM_CHG_BAUD])
+    test.assert_eq(serve(var mirror, [0x66, 0x07]), [telnetcom.COM_CHG_DATASIZE])
+    test.assert_eq(serve(var mirror, [0x67, 0x05]), [telnetcom.COM_CHG_PARITY])
+    test.assert_eq(serve(var mirror, [0x68, 0x03]), [telnetcom.COM_CHG_STOPSIZE])
+    test.assert_eq(mirror.baud, 115200)
+    test.assert_eq(mirror.datasize, 7)
+    test.assert_eq(mirror.parity, 5)
+    test.assert_eq(mirror.stopsize, 3)
+    // The same answer again is not a change.
+    test.assert_eq(serve(var mirror, [0x65, 0x00, 0x01, 0xC2, 0x00]), [0])
+    test.assert_eq(serve(var mirror, [0x66, 0x07]), [0])
+    test.assert_eq(serve(var mirror, [0x67, 0x05]), [0])
+    test.assert_eq(serve(var mirror, [0x68, 0x03]), [0])
+
+@test
+fn test_a_client_takes_control_answers() [io]
+    var m = telnetcom.com_new()
+    test.assert_eq(serve(var m, [0x69, 0x03]), [telnetcom.COM_CHG_FLOW])
+    test.assert_eq(serve(var m, [0x69, 0x05]), [telnetcom.COM_CHG_BREAK])
+    test.assert_eq(serve(var m, [0x69, 0x09]), [telnetcom.COM_CHG_DTR])
+    test.assert_eq(serve(var m, [0x69, 0x0C]), [telnetcom.COM_CHG_RTS])
+    test.assert_eq(serve(var m, [0x69, 0x10]), [telnetcom.COM_CHG_INFLOW])
+    test.assert_eq(m.flow, 3)
+    test.assert_eq(m.brk, true)
+    test.assert_eq(m.dtr, false)
+    test.assert_eq(m.rts, false)
+    test.assert_eq(m.inflow, 16)
+    test.assert_eq(serve(var m, [0x69, 0x06]), [telnetcom.COM_CHG_BREAK])
+    test.assert_eq(serve(var m, [0x69, 0x08]), [telnetcom.COM_CHG_DTR])
+    test.assert_eq(serve(var m, [0x69, 0x0B]), [telnetcom.COM_CHG_RTS])
+    test.assert_eq(m.brk, false)
+    test.assert_eq(m.dtr, true)
+    test.assert_eq(m.rts, true)
+    // A value that sets nothing, such as a request for the state.
+    test.assert_eq(serve(var m, [0x69, 0x04]), [0])
+
+@test
+fn test_a_client_takes_notifications_and_masks() [io]
+    var m = telnetcom.com_new()
+    test.assert_eq(serve(var m, [0x6A, 0x18]), [telnetcom.COM_CHG_STATE])
+    test.assert_eq(serve(var m, [0x6B, 0x31]), [telnetcom.COM_CHG_STATE])
+    test.assert_eq(m.linestate, 0x18)
+    test.assert_eq(m.modemstate, 0x31)
+    test.assert_eq(serve(var m, [0x6E, 0x0F]), [telnetcom.COM_CHG_STATE])
+    test.assert_eq(serve(var m, [0x6F, 0xF0]), [telnetcom.COM_CHG_STATE])
+    test.assert_eq(m.ls_mask, 0x0F)
+    test.assert_eq(m.ms_mask, 0xF0)
+    test.assert_eq(serve(var m, [0x70, 0x03]), [telnetcom.COM_CHG_PURGE])
+    test.assert_eq(m.purge, 3)
+
+@test
+fn test_a_client_ignores_short_and_unknown_answers() [io]
+    var m = telnetcom.com_new()
+    for code in [0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6E, 0x6F, 0x70]
+        test.case("code ${code}")
+        test.assert_eq(serve(var m, [code]), [0])
+    // Values outside the ranges.
+    test.assert_eq(serve(var m, [0x66, 0x09]), [0])
+    test.assert_eq(serve(var m, [0x67, 0x09]), [0])
+    test.assert_eq(serve(var m, [0x68, 0x09]), [0])
+    test.assert_eq(serve(var m, [0x70, 0x09]), [0])
+    test.assert_eq(serve(var m, [0x65, 0x00, 0x00, 0x00, 0x00]), [0])
+    test.assert_eq(serve(var m, [0xC8, 0x01]), [0])
+    test.assert_eq(m.baud, 9600)
+
+// Feed bytes to a session and hand every COM-PORT subnegotiation to the port;
+// answer the replies the port wrote.
+fn run_port(var sess: telnetsess.TelnetSession, var port: telnetcom.ComPort,
+            var wire: telnetwire.TelBuf, var replies: telnetwire.TelBuf)
+    for i in 0..wire.len()
+        if telnetsess.tel_rx_byte(var sess, wire[i] as Int) == telnetsess.TEL_EV_SUBNEG
+            if sess.sb_opt == telnetwire.TELOPT_COM_PORT
+                let _ = telnetcom.com_handle(var port, var sess.sub, var replies)
+
+@test
+fn test_a_client_and_a_server_agree_after_a_full_exchange_through_the_parser() [io]
+    var client = telnetcom.com_new()
+    var server = telnetcom.com_new()
+    var cs = telnetsess.tel_client()
+    var ss = telnetsess.tel_server()
+    var req: telnetwire.TelBuf = Vec.new()
+    let _ = telnetcom.com_set_baud(var req, 57600)
+    let _ = telnetcom.com_set_datasize(var req, 7)
+    let _ = telnetcom.com_set_parity(var req, telnetcom.COM_PARITY_ODD)
+    let _ = telnetcom.com_set_stopsize(var req, 2)
+    let _ = telnetcom.com_set_control(var req, 3)
+    let _ = telnetcom.com_set_control(var req, 9)
+    var replies: telnetwire.TelBuf = Vec.new()
+    run_port(var ss, var server, var req, var replies)
+    test.assert_eq(server.baud, 57600)
+    test.assert_eq(server.datasize, 7)
+    test.assert_eq(server.parity, telnetcom.COM_PARITY_ODD)
+    test.assert_eq(server.stopsize, 2)
+    test.assert_eq(server.flow, 3)
+    test.assert_eq(server.dtr, false)
+    // The answers come back, and the client's mirror agrees.
+    var unused: telnetwire.TelBuf = Vec.new()
+    run_port(var cs, var client, var replies, var unused)
+    test.assert_eq(client.baud, 57600)
+    test.assert_eq(client.datasize, 7)
+    test.assert_eq(client.parity, telnetcom.COM_PARITY_ODD)
+    test.assert_eq(client.stopsize, 2)
+    test.assert_eq(client.flow, 3)
+    test.assert_eq(client.dtr, false)
+    test.assert_eq(unused.len(), 0)

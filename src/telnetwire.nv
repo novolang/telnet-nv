@@ -1,0 +1,249 @@
+// telnetwire.nv — the bytes of a Telnet stream, written into a buffer the
+// caller owns, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Telnet (RFC 854)
+// carries two kinds of byte on one stream.  Data is the Network Virtual
+// Terminal's: printable characters, and the end of a line as CR LF.  Control
+// is introduced by the byte IAC, 255 ("interpret as command"), followed by a
+// command:
+//
+//   IAC cmd               a single command: NOP, DM, BRK, IP, AO, AYT, EC,
+//                         EL, GA (240 to 249) and EOR (239, RFC 885)
+//   IAC WILL/WONT opt     the sender will (or will not) perform the option
+//   IAC DO/DONT opt       the sender asks the receiver to perform it (or not)
+//   IAC SB opt data IAC SE  a subnegotiation: parameters of an option that
+//                         is on
+//
+// A data byte of 255 is sent as IAC IAC, and inside a subnegotiation the same
+// doubling applies.  This module builds those sequences.  It decides nothing
+// about them: the option rules are `telnetq`, the stream parser and the
+// session are `telnetsess`.
+//
+// The builders append to a `TelBuf`, 256 bytes.  Each is all or nothing: a
+// sequence that does not fit leaves the buffer as it was and answers false.
+
+// The byte that introduces a command: 255.
+pub const TEL_IAC = 255
+// DONT, 254: asks the peer not to perform an option.
+pub const TEL_DONT = 254
+// DO, 253: asks the peer to perform an option.
+pub const TEL_DO = 253
+// WONT, 252: the sender will not perform an option.
+pub const TEL_WONT = 252
+// WILL, 251: the sender will perform an option.
+pub const TEL_WILL = 251
+// SB, 250: begins a subnegotiation.
+pub const TEL_SB = 250
+// GA, 249: go ahead.
+pub const TEL_GA = 249
+// EL, 248: erase line.
+pub const TEL_EL = 248
+// EC, 247: erase character.
+pub const TEL_EC = 247
+// AYT, 246: are you there.
+pub const TEL_AYT = 246
+// AO, 245: abort output.
+pub const TEL_AO = 245
+// IP, 244: interrupt process.
+pub const TEL_IP = 244
+// BRK, 243: break.
+pub const TEL_BRK = 243
+// DM, 242: data mark.
+pub const TEL_DM = 242
+// NOP, 241: no operation.
+pub const TEL_NOP = 241
+// SE, 240: ends a subnegotiation.
+pub const TEL_SE = 240
+// EOR, 239: end of record (RFC 885).
+pub const TEL_EOR = 239
+
+// Option 0: transmit binary (RFC 856).
+pub const TELOPT_BINARY = 0
+// Option 1: echo (RFC 857).
+pub const TELOPT_ECHO = 1
+// Option 3: suppress go ahead (RFC 858).
+pub const TELOPT_SGA = 3
+// Option 24: terminal type (RFC 1091).
+pub const TELOPT_TTYPE = 24
+// Option 25: end of record (RFC 885).
+pub const TELOPT_EOR = 25
+// Option 31: negotiate about window size (RFC 1073).
+pub const TELOPT_NAWS = 31
+// Option 32: terminal speed (RFC 1079).
+pub const TELOPT_TSPEED = 32
+// Option 39: new environment option (RFC 1572).
+pub const TELOPT_NEW_ENVIRON = 39
+// Option 44: com port control (RFC 2217).
+pub const TELOPT_COM_PORT = 44
+
+// The sizes of a buffer of outgoing bytes.
+pub const TEL_BUF_MAX = 256
+
+// A buffer for outgoing bytes.
+pub alias TelBuf = Vec[u8; TEL_BUF_MAX]
+
+// The size of the buffer a received subnegotiation is kept in: 128 bytes.
+pub const TEL_SB_MAX = 128
+
+// A buffer for the parameters of a received subnegotiation: the bytes between
+// `IAC SB opt` and `IAC SE`, with the doubled IACs undone.
+pub alias TelSb = Vec[u8; TEL_SB_MAX]
+
+// Append one byte if there is room.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     println("${telnetwire.put_byte(var out, 65)} ${out.len()}")   // true 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_byte(var out: TelBuf, b: Int) -> Bool []
+    if out.len() >= TEL_BUF_MAX
+        return false
+    let _ = out.push((b & 0xFF) as u8)
+    true
+
+// Take the bytes after `mark` back off the buffer.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let _ = telnetwire.put_command(var out, telnetwire.TEL_NOP)
+//     let mark = out.len()
+//     let _ = telnetwire.put_negotiate(var out, telnetwire.TEL_DO, 1)
+//     telnetwire.rollback(var out, mark)
+//     println("${out.len()}")   // 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rollback(var out: TelBuf, mark: Int) []
+    let extra = out.len() - mark
+    for _i in 0..extra
+        let _ = out.pop()
+
+// Append `IAC cmd`.  The command is one of `TEL_NOP` to `TEL_GA` or
+// `TEL_EOR`; the function does not check.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetwire.put_command(var out, telnetwire.TEL_AYT)
+//     println("${ok} ${out[0]} ${out[1]}")   // true 255 246
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_command(var out: TelBuf, cmd: Int) -> Bool []
+    let mark = out.len()
+    if put_byte(var out, TEL_IAC) and put_byte(var out, cmd)
+        return true
+    rollback(var out, mark)
+    false
+
+// Append `IAC verb opt` for a `verb` of `TEL_WILL`, `TEL_WONT`, `TEL_DO` or
+// `TEL_DONT`.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetwire.put_negotiate(var out, telnetwire.TEL_WILL, telnetwire.TELOPT_NAWS)
+//     println("${ok} ${out[0]} ${out[1]} ${out[2]}")   // true 255 251 31
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_negotiate(var out: TelBuf, verb: Int, opt: Int) -> Bool []
+    let mark = out.len()
+    if put_byte(var out, TEL_IAC) and put_byte(var out, verb) and put_byte(var out, opt)
+        return true
+    rollback(var out, mark)
+    false
+
+// Append `IAC SB opt`, the start of a subnegotiation.  The parameters follow
+// with `put_sb_byte`, and `put_sb_end` closes it.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetwire.put_sb_begin(var out, telnetwire.TELOPT_TTYPE)
+//     println("${ok} ${out[1]} ${out[2]}")   // true 250 24
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_sb_begin(var out: TelBuf, opt: Int) -> Bool []
+    let mark = out.len()
+    if put_byte(var out, TEL_IAC) and put_byte(var out, TEL_SB) and put_byte(var out, opt)
+        return true
+    rollback(var out, mark)
+    false
+
+// Append one parameter byte of a subnegotiation: the byte itself, or IAC IAC
+// for 255.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let _ = telnetwire.put_sb_byte(var out, 7)
+//     let _ = telnetwire.put_sb_byte(var out, 255)
+//     println("${out.len()} ${out[1]} ${out[2]}")   // 3 255 255
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_sb_byte(var out: TelBuf, b: Int) -> Bool []
+    let mark = out.len()
+    if (b & 0xFF) == TEL_IAC
+        if put_byte(var out, TEL_IAC) and put_byte(var out, TEL_IAC)
+            return true
+        rollback(var out, mark)
+        return false
+    put_byte(var out, b)
+
+// Append a 16-bit parameter of a subnegotiation, high byte first, each byte
+// doubled if it is 255.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let _ = telnetwire.put_sb_u16(var out, 0x00FF)
+//     println("${out.len()}")   // 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_sb_u16(var out: TelBuf, v: Int) -> Bool []
+    let mark = out.len()
+    if put_sb_byte(var out, v >> 8) and put_sb_byte(var out, v)
+        return true
+    rollback(var out, mark)
+    false
+
+// Append `IAC SE`, the end of a subnegotiation.
+//
+// ```novo
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetwire.put_sb_end(var out)
+//     println("${ok} ${out[1]}")   // true 240
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_sb_end(var out: TelBuf) -> Bool []
+    let mark = out.len()
+    if put_byte(var out, TEL_IAC) and put_byte(var out, TEL_SE)
+        return true
+    rollback(var out, mark)
+    false

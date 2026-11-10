@@ -1,0 +1,501 @@
+// telnetopt.nv — the subnegotiations of the options that carry parameters,
+// built and read, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  An option that is on
+// can exchange parameters in a subnegotiation, `IAC SB opt ... IAC SE`.  Five
+// are here; the sixth that matters to a serial device, COM-PORT-CONTROL, is
+// `telnetcom`.
+//
+// TERMINAL-TYPE, RFC 1091, option 24.  The end that wants to know sends
+// `SB 24 SEND` (the byte 1); the other answers `SB 24 IS name` (0 and the
+// name of its terminal, "VT100" or "ANSI").  It may be asked again, and a
+// list of names ends when a name repeats.
+//
+// TERMINAL-SPEED, RFC 1079, option 32.  `SB 32 SEND` asks, and `SB 32 IS
+// "38400,38400"` answers with the transmit speed and the receive speed as
+// decimal text, a comma between.
+//
+// NAWS, RFC 1073, option 31.  `SB 31 w1 w2 h1 h2`: the width and the height of
+// the window in characters, each 16 bits, high byte first, and a byte of 255
+// doubled as everywhere in a subnegotiation.  A width of 0 means the sender
+// leaves the width to the receiver.
+//
+// NEW-ENVIRON, RFC 1572, option 39.  `SB 39 SEND` asks for variables (the
+// whole list when none is named), `SB 39 IS` answers and `SB 39 INFO` reports
+// a change.  The parameters are a run of items, each a kind byte, VAR (0),
+// VALUE (1), ESC (2) or USERVAR (3), and the text that follows it; a byte of
+// the text that is itself one of the four kinds is preceded by ESC.  A
+// variable is `VAR name VALUE text`.
+//
+// END OF RECORD, RFC 885, option 25.  When it is on, `IAC EOR` (239) marks the
+// end of a record; the command is `telnetwire.put_command(out, TEL_EOR)`.
+//
+// The builders are all or nothing, as those of `telnetwire` are.  The readers
+// take the `TelSb` the parser filled, whose first byte is the command or kind
+// byte that follows the option.
+
+use std.str
+use telnetwire
+
+// The subcommand IS, 0: here is the value.
+pub const TEL_IS = 0
+// The subcommand SEND, 1: send the value.
+pub const TEL_SEND = 1
+// The NEW-ENVIRON subcommand INFO, 2.
+pub const TEL_INFO = 2
+// The NEW-ENVIRON item kind VAR, 0: a well-known variable name.
+pub const TEL_ENV_VAR = 0
+// The NEW-ENVIRON item kind VALUE, 1.
+pub const TEL_ENV_VALUE = 1
+// The NEW-ENVIRON item kind ESC, 2: the next byte is text.
+pub const TEL_ENV_ESC = 2
+// The NEW-ENVIRON item kind USERVAR, 3: a user-defined variable name.
+pub const TEL_ENV_USERVAR = 3
+
+// Append `SB 24 SEND`: asks the peer for its terminal type.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.ttype_send(var out)
+//     println("${ok} ${out.len()} ${out[2]} ${out[3]}")   // true 6 24 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ttype_send(var out: TelBuf) -> Bool []
+    let mark = out.len()
+    if telnetwire.put_sb_begin(var out, TELOPT_TTYPE) and telnetwire.put_sb_byte(var out, TEL_SEND) and telnetwire.put_sb_end(var out)
+        return true
+    telnetwire.rollback(var out, mark)
+    false
+
+// Append `SB 24 IS name`: this end's terminal type.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.ttype_is(var out, "VT100")
+//     println("${ok} ${out.len()} ${out[3]} ${out[4]}")   // true 11 0 86
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ttype_is(var out: TelBuf, name: Str) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_begin(var out, TELOPT_TTYPE) and telnetwire.put_sb_byte(var out, TEL_IS)
+    for i in 0..str.len(name)
+        ok = ok and telnetwire.put_sb_byte(var out, str.byte_at_or(name, i, 0))
+    ok = ok and telnetwire.put_sb_end(var out)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// Append `SB 24 IS name` for a name held in a buffer, as the session keeps it.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var name: Vec[u8; 40] = Vec.new()
+//     let _ = name.push(65)
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.ttype_is_bytes(var out, var name)
+//     println("${ok} ${out.len()} ${out[4]}")   // true 7 65
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ttype_is_bytes(var out: TelBuf, var name: Vec[u8; 40]) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_begin(var out, TELOPT_TTYPE) and telnetwire.put_sb_byte(var out, TEL_IS)
+    for i in 0..name.len()
+        ok = ok and telnetwire.put_sb_byte(var out, name[i] as Int)
+    ok = ok and telnetwire.put_sb_end(var out)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// Append `SB 32 SEND`: asks the peer for its terminal speed.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.tspeed_send(var out)
+//     println("${ok} ${out.len()} ${out[2]} ${out[3]}")   // true 6 32 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tspeed_send(var out: TelBuf) -> Bool []
+    let mark = out.len()
+    if telnetwire.put_sb_begin(var out, TELOPT_TSPEED) and telnetwire.put_sb_byte(var out, TEL_SEND) and telnetwire.put_sb_end(var out)
+        return true
+    telnetwire.rollback(var out, mark)
+    false
+
+// Append the decimal digits of `v`, 0 or more.
+@tier(embedded)
+@no_alloc
+fn put_decimal(var out: TelBuf, v: Int) -> Bool []
+    var digits: Vec[u8; 20] = Vec.new()
+    var n = v
+    if n < 0
+        n = 0
+    for _i in 0..19
+        if n > 0 or digits.len() == 0
+            let _ = digits.push((48 + n % 10) as u8)
+            n = n / 10
+    var ok = true
+    for i in 0..digits.len()
+        ok = ok and telnetwire.put_sb_byte(var out, digits[digits.len() - 1 - i] as Int)
+    ok
+
+// Append `SB 32 IS "tx,rx"`: the transmit and the receive speed in bits a
+// second, as decimal text.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.tspeed_is(var out, 38400, 9600)
+//     println("${ok} ${out.len()} ${out[4]} ${out[9]}")   // true 16 51 44
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tspeed_is(var out: TelBuf, tx: Int, rx: Int) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_begin(var out, TELOPT_TSPEED) and telnetwire.put_sb_byte(var out, TEL_IS)
+    ok = ok and put_decimal(var out, tx) and telnetwire.put_sb_byte(var out, 44) and put_decimal(var out, rx)
+    ok = ok and telnetwire.put_sb_end(var out)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// Append `SB 31 w1 w2 h1 h2`: the window is `cols` characters wide and
+// `rows` high, each cut to 16 bits.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.naws(var out, 80, 24)
+//     println("${ok} ${out.len()} ${out[4]} ${out[6]}")   // true 9 80 24
+// ```
+pub @tier(embedded)
+@no_alloc
+fn naws(var out: TelBuf, cols: Int, rows: Int) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_begin(var out, TELOPT_NAWS)
+    ok = ok and telnetwire.put_sb_u16(var out, cols & 0xFFFF) and telnetwire.put_sb_u16(var out, rows & 0xFFFF)
+    ok = ok and telnetwire.put_sb_end(var out)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// Begin a NEW-ENVIRON subnegotiation with the subcommand `cmd` (`TEL_IS`,
+// `TEL_SEND` or `TEL_INFO`).  Items follow with `environ_item`, and
+// `put_sb_end` closes it.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetopt.environ_begin(var out, telnetopt.TEL_IS)
+//     println("${ok} ${out.len()} ${out[2]} ${out[3]}")   // true 4 39 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn environ_begin(var out: TelBuf, cmd: Int) -> Bool []
+    let mark = out.len()
+    if telnetwire.put_sb_begin(var out, TELOPT_NEW_ENVIRON) and telnetwire.put_sb_byte(var out, cmd)
+        return true
+    telnetwire.rollback(var out, mark)
+    false
+
+// Append one item: its kind byte (`TEL_ENV_VAR`, `TEL_ENV_VALUE` or
+// `TEL_ENV_USERVAR`) and its text, with ESC before each byte of the text that
+// is itself a kind byte.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let _ = telnetopt.environ_begin(var out, telnetopt.TEL_IS)
+//     let ok = telnetopt.environ_item(var out, telnetopt.TEL_ENV_VAR, "USER")
+//     println("${ok} ${out.len()} ${out[4]} ${out[5]}")   // true 9 0 85
+// ```
+pub @tier(embedded)
+@no_alloc
+fn environ_item(var out: TelBuf, kind: Int, text: Str) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_byte(var out, kind)
+    for i in 0..str.len(text)
+        let c = str.byte_at_or(text, i, 0)
+        if c <= TEL_ENV_USERVAR
+            ok = ok and telnetwire.put_sb_byte(var out, TEL_ENV_ESC)
+        ok = ok and telnetwire.put_sb_byte(var out, c)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// The 16-bit width in a received NAWS subnegotiation, or -1 when it does not
+// hold exactly four bytes.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [0, 80, 0, 24]
+//         let _ = sub.push(b as u8)
+//     println("${telnetopt.sb_naws_cols(var sub)} ${telnetopt.sb_naws_rows(var sub)}")   // 80 24
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sb_naws_cols(var sub: TelSb) -> Int []
+    if sub.len() != 4
+        return -1
+    (sub[0] as Int << 8) | sub[1] as Int
+
+// The 16-bit height in a received NAWS subnegotiation, or -1.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     println("${telnetopt.sb_naws_rows(var sub)}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sb_naws_rows(var sub: TelSb) -> Int []
+    if sub.len() != 4
+        return -1
+    (sub[2] as Int << 8) | sub[3] as Int
+
+// The decimal number in a received TERMINAL-SPEED `IS` that starts at
+// `from`, up to a comma or the end, or -1 when there is no digit or a byte
+// that is not one.
+@tier(embedded)
+@no_alloc
+fn sb_number(var sub: TelSb, from: Int) -> Int []
+    var v = 0
+    var digits = 0
+    for i in from..sub.len()
+        let c = sub[i] as Int
+        if c == 44
+            return -1
+        if c < 48 or c > 57
+            return -1
+        if digits < 9
+            v = v * 10 + (c - 48)
+            digits = digits + 1
+    if digits == 0
+        return -1
+    v
+
+// The position of the comma in a TERMINAL-SPEED `IS`, or -1.
+@tier(embedded)
+@no_alloc
+fn sb_comma(var sub: TelSb) -> Int []
+    for i in 1..sub.len()
+        if sub[i] == 44
+            return i
+    -1
+
+// The transmit speed in a received TERMINAL-SPEED `IS`, or -1 when the text
+// is not `tx,rx` in decimal.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [0, 57, 54, 48, 48, 44, 49, 50, 48, 48]
+//         let _ = sub.push(b as u8)
+//     println("${telnetopt.sb_tspeed_tx(var sub)} ${telnetopt.sb_tspeed_rx(var sub)}")   // 9600 1200
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sb_tspeed_tx(var sub: TelSb) -> Int []
+    let comma = sb_comma(var sub)
+    if comma < 0 or sub.len() < 1 or sub[0] != TEL_IS
+        return -1
+    var v = 0
+    var digits = 0
+    for i in 1..comma
+        let c = sub[i] as Int
+        if c < 48 or c > 57
+            return -1
+        if digits < 9
+            v = v * 10 + (c - 48)
+            digits = digits + 1
+    if digits == 0
+        return -1
+    v
+
+// The receive speed in a received TERMINAL-SPEED `IS`, or -1.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     println("${telnetopt.sb_tspeed_rx(var sub)}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sb_tspeed_rx(var sub: TelSb) -> Int []
+    let comma = sb_comma(var sub)
+    if comma < 0 or sub.len() < 1 or sub[0] != TEL_IS
+        return -1
+    sb_number(var sub, comma + 1)
+
+// Copy the name in a received TERMINAL-TYPE `IS` into `dst`, which is emptied
+// first and takes at most its capacity; answers the number of bytes copied,
+// or -1 when the subnegotiation is not an `IS`.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [0, 86, 84, 49, 48, 48]
+//         let _ = sub.push(b as u8)
+//     var name: Vec[u8; 40] = Vec.new()
+//     println("${telnetopt.sb_ttype_name(var sub, var name)} ${name[0]}")   // 5 86
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sb_ttype_name(var sub: TelSb, var dst: Vec[u8; 40]) -> Int []
+    dst.clear()
+    if sub.len() < 1 or sub[0] != TEL_IS
+        return -1
+    for i in 1..sub.len()
+        let _ = dst.push(sub[i])
+    dst.len()
+
+// An item of a NEW-ENVIRON subnegotiation: where the walk is, the kind of the
+// item last found, and where its text lies in the buffer (still escaped).
+pub @value
+struct EnvIter
+    // The index of the next byte to look at.
+    pos: Int
+    // The kind of the item last found: `TEL_ENV_VAR`, `TEL_ENV_VALUE` or
+    // `TEL_ENV_USERVAR`.
+    kind: Int
+    // The index of the first byte of its text.
+    start: Int
+    // The number of bytes of its text, escapes included.
+    len: Int
+
+// An iterator at the first item of a received NEW-ENVIRON subnegotiation,
+// whose first byte is the subcommand.
+//
+// ```novo
+// use telnetopt
+//
+// fn main() [io]
+//     let it = telnetopt.environ_iter()
+//     println("${it.pos}")   // 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn environ_iter() -> EnvIter []
+    EnvIter { pos: 1, kind: 0, start: 0, len: 0 }
+
+// Whether byte `c` begins an item: VAR, VALUE or USERVAR.
+@tier(embedded)
+@no_alloc
+fn is_kind(c: Int) -> Bool []
+    c == TEL_ENV_VAR or c == TEL_ENV_VALUE or c == TEL_ENV_USERVAR
+
+// Move to the next item and answer whether there was one.  Bytes before the
+// first kind byte are skipped.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [0, 0, 85, 83, 1, 120]
+//         let _ = sub.push(b as u8)
+//     var it = telnetopt.environ_iter()
+//     var n = 0
+//     for _i in 0..4
+//         if telnetopt.environ_next(var sub, var it)
+//             n = n + it.len
+//     println("${n}")   // 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn environ_next(var sub: TelSb, var it: EnvIter) -> Bool []
+    var p = it.pos
+    for _i in 0..TEL_SB_MAX
+        if p < sub.len() and not is_kind(sub[p] as Int)
+            p = p + 1
+    if p >= sub.len()
+        it.pos = p
+        return false
+    it.kind = sub[p] as Int
+    it.start = p + 1
+    var q = it.start
+    for _i in 0..TEL_SB_MAX
+        if q < sub.len() and not is_kind(sub[q] as Int)
+            if sub[q] == TEL_ENV_ESC and q + 1 < sub.len()
+                q = q + 2
+            else
+                q = q + 1
+    it.len = q - it.start
+    it.pos = q
+    true
+
+// Copy the text of the item into `dst`, which is emptied first, with each ESC
+// removed; answers the number of bytes copied.
+//
+// ```novo
+// use telnetopt
+// use telnetwire
+//
+// fn main() [io]
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [0, 0, 65, 2, 1, 66]
+//         let _ = sub.push(b as u8)
+//     var it = telnetopt.environ_iter()
+//     let _ = telnetopt.environ_next(var sub, var it)
+//     var text: Vec[u8; 40] = Vec.new()
+//     println("${telnetopt.environ_text(var sub, it, var text)} ${text[1]}")   // 3 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn environ_text(var sub: TelSb, it: EnvIter, var dst: Vec[u8; 40]) -> Int []
+    dst.clear()
+    var i = it.start
+    for _i in 0..TEL_SB_MAX
+        if i < it.start + it.len
+            if sub[i] == TEL_ENV_ESC and i + 1 < it.start + it.len
+                i = i + 1
+            let _ = dst.push(sub[i])
+            i = i + 1
+    dst.len()

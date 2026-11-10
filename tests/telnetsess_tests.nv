@@ -1,0 +1,574 @@
+// telnetsess_tests.nv — the stream, the options and the two ends.
+//
+// The byte strings are worked out from RFC 854, 855, 856, 1073, 1079 and 1091:
+//
+//     IAC IAC                    FF FF        the data byte 255
+//     IAC DO ECHO                FF FD 01
+//     IAC SB NAWS 0 80 0 24 IAC SE
+//                                FF FA 1F 00 50 00 18 FF F0
+//     CR LF, CR NUL              0D 0A, 0D 00
+//
+// THE BUSYBOX OPENING.  The telnet daemon of BusyBox writes these twelve
+// bytes as soon as a client connects; they are the array `iacs_to_send` in
+// networking/telnetd.c of BusyBox
+// (https://raw.githubusercontent.com/mirror/busybox/master/networking/telnetd.c):
+//
+//     IAC DO ECHO, IAC DO NAWS, IAC WILL ECHO, IAC WILL SGA
+//     FF FD 01     FF FD 1F     FF FB 01      FF FB 03
+//
+// That is a printed array in the source, not a capture; what a client answers
+// to it is worked out here from RFC 1143.  Asked to DO ECHO, a client does not
+// echo, so it answers WONT; asked to DO NAWS it agrees, and sends the window;
+// told that the server WILL ECHO and WILL SGA it asks the server to (DO).
+//
+//     client sends   FF FC 01
+//                    FF FB 1F  FF FA 1F 00 50 00 18 FF F0
+//                    FF FD 01
+//                    FF FD 03
+//
+// Two sessions are also run against each other (`pump`): a server that opens
+// the way such servers do, and a client.
+
+use std.list
+use std.test
+use telnetsess
+use telnetwire
+
+// The bytes the session has queued, taken one at a time.
+fn drain(var s: telnetsess.TelnetSession) -> [Int]
+    var out: [Int] = []
+    for _i in 0..300
+        let b = telnetsess.tel_tx_next(var s)
+        if b >= 0
+            list.push(out, b)
+    out
+
+// Feed bytes to a session; answer the events other than NONE and DATA as
+// [event, opt, side] lists, and the data bytes in `data`.
+fn feed(var s: telnetsess.TelnetSession, xs: [Int], var data: [Int]) -> [[Int]]
+    var events: [[Int]] = []
+    for b in xs
+        let ev = telnetsess.tel_rx_byte(var s, b)
+        if ev == telnetsess.TEL_EV_DATA
+            list.push(data, s.data)
+        elif ev == telnetsess.TEL_EV_CMD
+            list.push(events, [ev, s.cmd])
+        elif ev == telnetsess.TEL_EV_OPT_ON or ev == telnetsess.TEL_EV_OPT_OFF
+            list.push(events, [ev, s.opt, s.side])
+        elif ev != telnetsess.TEL_EV_NONE
+            list.push(events, [ev, s.sb_opt])
+    events
+
+// Move everything one session has queued into the other, until both are quiet.
+// Answers the number of rounds it took.
+fn pump(var a: telnetsess.TelnetSession, var b: telnetsess.TelnetSession) -> Int
+    var rounds = 0
+    for _i in 0..20
+        let xa = drain(var a)
+        let xb = drain(var b)
+        var sink: [Int] = []
+        if list.len(xa) > 0 or list.len(xb) > 0
+            rounds = rounds + 1
+        let _ = feed(var b, xa, var sink)
+        let _ = feed(var a, xb, var sink)
+    rounds
+
+@test
+fn test_the_values() [io]
+    test.assert_eq(telnetsess.TEL_EV_NONE, 0)
+    test.assert_eq(telnetsess.TEL_EV_DATA, 1)
+    test.assert_eq(telnetsess.TEL_EV_CMD, 2)
+    test.assert_eq(telnetsess.TEL_EV_OPT_ON, 3)
+    test.assert_eq(telnetsess.TEL_EV_OPT_OFF, 4)
+    test.assert_eq(telnetsess.TEL_EV_SUBNEG, 5)
+    test.assert_eq(telnetsess.TEL_EV_SB_ERROR, 6)
+    test.assert_eq(telnetsess.TEL_US, 0)
+    test.assert_eq(telnetsess.TEL_HIM, 1)
+
+@test
+fn test_every_known_option_has_a_slot_and_a_bit() [io]
+    let opts = [0, 1, 3, 24, 25, 31, 32, 39, 44]
+    for i in 0..9
+        test.assert_eq(telnetsess.tel_slot(opts[i]), i)
+        test.assert_eq(telnetsess.tel_bit(opts[i]), 1 << i)
+    test.assert_eq(telnetsess.tel_slot(2), -1)
+    test.assert_eq(telnetsess.tel_slot(99), -1)
+    test.assert_eq(telnetsess.tel_bit(99), 0)
+
+@test
+fn test_the_roles_agree_to_different_options() [io]
+    let c = telnetsess.tel_client()
+    let s = telnetsess.tel_server()
+    test.assert_eq(c.server, false)
+    test.assert_eq(s.server, true)
+    test.assert_eq(c.local_ok, s.remote_ok)
+    test.assert_eq(c.remote_ok, s.local_ok)
+    test.assert_eq(telnetsess.tel_is_on(c, telnetsess.TEL_US, 31), false)
+    test.assert_eq(telnetsess.tel_is_on(c, telnetsess.TEL_US, 99), false)
+
+// ── Data ───────────────────────────────────────────────────────────
+
+@test
+fn test_text_is_delivered_byte_for_byte() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0x68, 0x69, 0x0D, 0x0A], var data)
+    test.assert_eq(data, [0x68, 0x69, 0x0D, 0x0A])
+    test.assert_eq(ev, [])
+
+@test
+fn test_a_carriage_return_and_nul_is_one_carriage_return() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0x41, 0x0D, 0x00, 0x42, 0x0D, 0x0A, 0x0D, 0x00, 0x00], var data)
+    // A, CR (NUL dropped), B, CR LF, CR (NUL dropped), and a NUL that does not
+    // follow a CR is data.
+    test.assert_eq(data, [0x41, 0x0D, 0x42, 0x0D, 0x0A, 0x0D, 0x00])
+
+@test
+fn test_a_doubled_iac_is_the_data_byte_255() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0x41, 0xFF, 0xFF, 0x42], var data)
+    test.assert_eq(data, [0x41, 0xFF, 0x42])
+    test.assert_eq(ev, [])
+
+@test
+fn test_a_doubled_iac_after_a_carriage_return_is_data() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0x0D, 0xFF, 0xFF, 0x00], var data)
+    // CR, then 255 (which ends the CR rule), then a NUL that is data.
+    test.assert_eq(data, [0x0D, 0xFF, 0x00])
+
+@test
+fn test_binary_from_the_peer_turns_the_carriage_return_rule_off() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0xFF, 0xFB, 0x00], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_OPT_ON, 0, telnetsess.TEL_HIM]])
+    test.assert_eq(drain(var s), [0xFF, 0xFD, 0x00])
+    let _ = feed(var s, [0x0D, 0x00, 0x41], var data)
+    test.assert_eq(data, [0x0D, 0x00, 0x41])
+
+@test
+fn test_a_command_is_reported_and_not_delivered() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0x41, 0xFF, 0xF6, 0xFF, 0xF4, 0xFF, 0xEF, 0xFF, 0xF1, 0x42], var data)
+    test.assert_eq(data, [0x41, 0x42])
+    test.assert_eq(ev, [[telnetsess.TEL_EV_CMD, 0xF6], [telnetsess.TEL_EV_CMD, 0xF4],
+                        [telnetsess.TEL_EV_CMD, 0xEF], [telnetsess.TEL_EV_CMD, 0xF1]])
+
+@test
+fn test_a_stray_se_and_an_unknown_command_byte_are_dropped() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0xFF, 0xF0, 0xFF, 0x10, 0x41], var data)
+    test.assert_eq(ev, [])
+    test.assert_eq(data, [0x41])
+
+@test
+fn test_only_the_low_eight_bits_of_a_byte_are_read() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0x141, 0x1FF, 0x1FF], var data)
+    test.assert_eq(data, [0x41, 0xFF])
+
+// ── Sending data ───────────────────────────────────────────────────
+
+fn send_text(var s: telnetsess.TelnetSession, xs: [Int]) -> [Int]
+    var out: telnetwire.TelBuf = Vec.new()
+    for x in xs
+        let _ = telnetsess.tel_data(var s, x, var out)
+    let _ = telnetsess.tel_flush(var s, var out)
+    var r: [Int] = []
+    for i in 0..out.len()
+        list.push(r, out[i] as Int)
+    r
+
+@test
+fn test_a_line_ends_in_cr_lf_and_a_lone_cr_in_cr_nul() [io]
+    var s = telnetsess.tel_client()
+    // "A\r\nB\rC\r": CR LF stays; the CR before C gets a NUL; so does the
+    // last, at the flush.
+    test.assert_eq(send_text(var s, [0x41, 0x0D, 0x0A, 0x42, 0x0D, 0x43, 0x0D]),
+                   [0x41, 0x0D, 0x0A, 0x42, 0x0D, 0x00, 0x43, 0x0D, 0x00])
+
+@test
+fn test_255_is_sent_doubled() [io]
+    var s = telnetsess.tel_client()
+    test.assert_eq(send_text(var s, [0xFF, 0x41]), [0xFF, 0xFF, 0x41])
+
+@test
+fn test_a_cr_before_a_255_gets_its_nul_first() [io]
+    var s = telnetsess.tel_client()
+    test.assert_eq(send_text(var s, [0x0D, 0xFF]), [0x0D, 0x00, 0xFF, 0xFF])
+
+@test
+fn test_with_binary_on_for_this_end_a_cr_is_sent_alone() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    // The server asks us to DO BINARY: we agree.
+    let ev = feed(var s, [0xFF, 0xFD, 0x00], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_OPT_ON, 0, telnetsess.TEL_US]])
+    test.assert_eq(drain(var s), [0xFF, 0xFB, 0x00])
+    test.assert_eq(send_text(var s, [0x0D, 0x41, 0xFF]), [0x0D, 0x41, 0xFF, 0xFF])
+
+@test
+fn test_flush_with_nothing_owed_is_true_and_writes_nothing() [io]
+    var s = telnetsess.tel_client()
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetsess.tel_flush(var s, var out), true)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_data_that_does_not_fit_is_refused_and_leaves_the_buffer_alone() [io]
+    var s = telnetsess.tel_client()
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - 1
+        let _ = out.push(0x55)
+    test.assert_eq(telnetsess.tel_data(var s, 0xFF, var out), false)
+    test.assert_eq(out.len(), telnetwire.TEL_BUF_MAX - 1)
+    test.assert_eq(telnetsess.tel_data(var s, 0x41, var out), true)
+    test.assert_eq(telnetsess.tel_data(var s, 0x41, var out), false)
+    // A CR owes a NUL that does not fit: refused, and still owed.
+    var t = telnetsess.tel_client()
+    var full: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - 1
+        let _ = full.push(0x55)
+    test.assert_eq(telnetsess.tel_data(var t, 0x0D, var full), true)
+    test.assert_eq(telnetsess.tel_flush(var t, var full), false)
+    test.assert_eq(t.tx_cr, true)
+
+// ── Options ────────────────────────────────────────────────────────
+
+@test
+fn test_the_busybox_opening_gets_the_answers_worked_out_above() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0xFF, 0xFD, 0x01, 0xFF, 0xFD, 0x1F, 0xFF, 0xFB, 0x01, 0xFF, 0xFB, 0x03], var data)
+    test.assert_eq(drain(var s),
+                   [0xFF, 0xFC, 0x01,
+                    0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0,
+                    0xFF, 0xFD, 0x01,
+                    0xFF, 0xFD, 0x03])
+    test.assert_eq(ev, [[telnetsess.TEL_EV_OPT_ON, 31, telnetsess.TEL_US],
+                        [telnetsess.TEL_EV_OPT_ON, 1, telnetsess.TEL_HIM],
+                        [telnetsess.TEL_EV_OPT_ON, 3, telnetsess.TEL_HIM]])
+    test.assert_eq(telnetsess.tel_is_on(s, telnetsess.TEL_US, 1), false)
+    test.assert_eq(telnetsess.tel_is_on(s, telnetsess.TEL_US, 31), true)
+    test.assert_eq(telnetsess.tel_is_on(s, telnetsess.TEL_HIM, 1), true)
+
+@test
+fn test_an_offer_again_is_not_answered_again() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFB, 0x01], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFD, 0x01])
+    let ev = feed(var s, [0xFF, 0xFB, 0x01], var data)
+    test.assert_eq(drain(var s), [])
+    test.assert_eq(ev, [])
+
+@test
+fn test_withdrawing_an_option_is_acknowledged_once() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFB, 0x01], var data)
+    let _ = drain(var s)
+    let ev = feed(var s, [0xFF, 0xFC, 0x01], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFE, 0x01])
+    test.assert_eq(ev, [[telnetsess.TEL_EV_OPT_OFF, 1, telnetsess.TEL_HIM]])
+    let again = feed(var s, [0xFF, 0xFC, 0x01], var data)
+    test.assert_eq(drain(var s), [])
+    test.assert_eq(again, [])
+
+@test
+fn test_do_and_dont_for_this_end() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let on = feed(var s, [0xFF, 0xFD, 0x18], var data)
+    test.assert_eq(on, [[telnetsess.TEL_EV_OPT_ON, 24, telnetsess.TEL_US]])
+    test.assert_eq(drain(var s), [0xFF, 0xFB, 0x18])
+    let off = feed(var s, [0xFF, 0xFE, 0x18], var data)
+    test.assert_eq(off, [[telnetsess.TEL_EV_OPT_OFF, 24, telnetsess.TEL_US]])
+    test.assert_eq(drain(var s), [0xFF, 0xFC, 0x18])
+
+@test
+fn test_an_option_not_agreed_is_refused() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    // A client does not agree to perform ECHO, and does not let the server
+    // perform TERMINAL-TYPE.
+    let _ = feed(var s, [0xFF, 0xFD, 0x01, 0xFF, 0xFB, 0x18], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFC, 0x01, 0xFF, 0xFE, 0x18])
+
+@test
+fn test_an_option_the_package_does_not_know_is_refused() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let ev = feed(var s, [0xFF, 0xFB, 0x63, 0xFF, 0xFD, 0x63, 0xFF, 0xFC, 0x63, 0xFF, 0xFE, 0x63], var data)
+    // WILL -> DONT, DO -> WONT; WONT and DONT are not answered.
+    test.assert_eq(drain(var s), [0xFF, 0xFE, 0x63, 0xFF, 0xFC, 0x63])
+    test.assert_eq(ev, [])
+
+@test
+fn test_ask_makes_the_requests_of_this_end() [io]
+    var s = telnetsess.tel_server()
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_WILL, telnetwire.TELOPT_ECHO), true)
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_DO, telnetwire.TELOPT_NAWS), true)
+    test.assert_eq(drain(var s), [0xFF, 0xFB, 0x01, 0xFF, 0xFD, 0x1F])
+    // Asking again while the answer is awaited sends nothing.
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_WILL, telnetwire.TELOPT_ECHO), true)
+    test.assert_eq(drain(var s), [])
+    // Withdrawing a request that has not been answered is queued, not sent.
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_WONT, telnetwire.TELOPT_ECHO), true)
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_DONT, telnetwire.TELOPT_NAWS), true)
+    test.assert_eq(drain(var s), [])
+
+@test
+fn test_ask_refuses_an_unknown_option_and_an_unknown_verb() [io]
+    var s = telnetsess.tel_server()
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_DO, 99), false)
+    test.assert_eq(telnetsess.tel_ask(var s, 7, telnetwire.TELOPT_ECHO), false)
+    test.assert_eq(drain(var s), [])
+
+@test
+fn test_ask_to_turn_off_an_option_that_is_on_sends_the_refusal() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFB, 0x1F], var data)
+    let _ = drain(var s)
+    test.assert_eq(telnetsess.tel_is_on(s, telnetsess.TEL_HIM, 31), true)
+    test.assert_eq(telnetsess.tel_ask(var s, telnetwire.TEL_DONT, telnetwire.TELOPT_NAWS), true)
+    test.assert_eq(drain(var s), [0xFF, 0xFE, 0x1F])
+    var t = telnetsess.tel_client()
+    let _ = feed(var t, [0xFF, 0xFD, 0x1F], var data)
+    let _ = drain(var t)
+    test.assert_eq(telnetsess.tel_ask(var t, telnetwire.TEL_WONT, telnetwire.TELOPT_NAWS), true)
+    test.assert_eq(drain(var t), [0xFF, 0xFC, 0x1F])
+
+@test
+fn test_a_server_opens_with_its_offers_and_a_client_with_none() [io]
+    var s = telnetsess.tel_server()
+    telnetsess.tel_start(var s)
+    test.assert_eq(drain(var s),
+        [0xFF, 0xFB, 0x01, 0xFF, 0xFB, 0x03, 0xFF, 0xFD, 0x1F, 0xFF, 0xFD, 0x18, 0xFF, 0xFD, 0x20])
+    var c = telnetsess.tel_client()
+    telnetsess.tel_start(var c)
+    test.assert_eq(drain(var c), [])
+
+// ── The queue ──────────────────────────────────────────────────────
+
+@test
+fn test_the_queue_is_taken_a_byte_at_a_time_or_all_at_once() [io]
+    var s = telnetsess.tel_server()
+    telnetsess.tel_start(var s)
+    test.assert_eq(telnetsess.tel_tx_pending(s), true)
+    test.assert_eq(telnetsess.tel_tx_next(var s), 0xFF)
+    test.assert_eq(telnetsess.tel_tx_next(var s), 0xFB)
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetsess.tel_tx_drain(var s, var out), 13)
+    test.assert_eq(out[0], 0x01)
+    test.assert_eq(telnetsess.tel_tx_pending(s), false)
+    test.assert_eq(telnetsess.tel_tx_next(var s), -1)
+    test.assert_eq(telnetsess.tel_tx_drain(var s, var out), 0)
+
+@test
+fn test_drain_stops_when_the_target_is_full() [io]
+    var s = telnetsess.tel_server()
+    telnetsess.tel_start(var s)
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - 4
+        let _ = out.push(0x55)
+    test.assert_eq(telnetsess.tel_tx_drain(var s, var out), 4)
+    test.assert_eq(telnetsess.tel_tx_pending(s), true)
+    test.assert_eq(telnetsess.tel_tx_next(var s), 0xFB)
+
+@test
+fn test_replies_that_do_not_fit_the_queue_are_counted() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    // 100 offers of an option nobody knows: each is a three-byte refusal, and
+    // the queue holds 256 bytes.
+    for _i in 0..100
+        let _ = feed(var s, [0xFF, 0xFB, 0x63], var data)
+    test.assert_eq(s.tx_lost, 100 - 85)
+    test.assert_eq(list.len(drain(var s)), 255)
+
+@test
+fn test_a_window_report_that_does_not_fit_is_counted() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    for _i in 0..84
+        let _ = feed(var s, [0xFF, 0xFB, 0x63], var data)
+    // 252 bytes queued; the WILL NAWS takes three and the window nine more.
+    let _ = feed(var s, [0xFF, 0xFD, 0x1F], var data)
+    test.assert_eq(s.tx_lost, 1)
+
+// ── Subnegotiation ─────────────────────────────────────────────────
+
+@test
+fn test_a_subnegotiation_is_delivered_whole_with_its_doubled_iac_undone() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    // An option the session does not answer for itself, with a 255 in it.
+    let ev = feed(var s, [0xFF, 0xFA, 0x27, 0x00, 0x41, 0xFF, 0xFF, 0x42, 0xFF, 0xF0], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SUBNEG, 39]])
+    test.assert_eq(s.sub.len(), 4)
+    test.assert_eq(s.sub[2], 0xFF)
+    test.assert_eq(data, [])
+
+@test
+fn test_an_empty_subnegotiation_is_delivered() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    let ev = feed(var s, [0xFF, 0xFA, 0x2C, 0xFF, 0xF0], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SUBNEG, 44]])
+    test.assert_eq(s.sub.len(), 0)
+
+@test
+fn test_a_subnegotiation_that_is_abandoned_is_reported() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    // IAC then a byte that is neither SE nor IAC.
+    let ev = feed(var s, [0xFF, 0xFA, 0x27, 0x00, 0xFF, 0xF1, 0x41], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SB_ERROR, 39]])
+    // The byte after the abandoned one is data again.
+    test.assert_eq(data, [0x41])
+
+@test
+fn test_a_subnegotiation_longer_than_the_buffer_is_reported_and_dropped() [io]
+    var s = telnetsess.tel_server()
+    var xs: [Int] = [0xFF, 0xFA, 0x27]
+    for _i in 0..telnetwire.TEL_SB_MAX + 5
+        list.push(xs, 0x41)
+    xs = list.concat(xs, [0xFF, 0xF0])
+    var data: [Int] = []
+    let ev = feed(var s, xs, var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SB_ERROR, 39]])
+    // The next one is read afresh.
+    let again = feed(var s, [0xFF, 0xFA, 0x27, 0x00, 0xFF, 0xF0], var data)
+    test.assert_eq(again, [[telnetsess.TEL_EV_SUBNEG, 39]])
+    test.assert_eq(s.sub.len(), 1)
+
+@test
+fn test_a_subnegotiation_of_exactly_the_buffers_size_fits() [io]
+    var s = telnetsess.tel_server()
+    var xs: [Int] = [0xFF, 0xFA, 0x27]
+    for _i in 0..telnetwire.TEL_SB_MAX
+        list.push(xs, 0x41)
+    xs = list.concat(xs, [0xFF, 0xF0])
+    var data: [Int] = []
+    test.assert_eq(feed(var s, xs, var data), [[telnetsess.TEL_EV_SUBNEG, 39]])
+    test.assert_eq(s.sub.len(), telnetwire.TEL_SB_MAX)
+
+@test
+fn test_naws_from_the_peer_is_stored_when_the_option_is_on() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    // Not on yet: the report is delivered and not stored.
+    let _ = feed(var s, [0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0], var data)
+    test.assert_eq(s.cols, 0)
+    let _ = feed(var s, [0xFF, 0xFB, 0x1F], var data)
+    let _ = drain(var s)
+    let ev = feed(var s, [0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SUBNEG, 31]])
+    test.assert_eq(s.cols, 80)
+    test.assert_eq(s.rows, 24)
+    // A report of the wrong length is not stored.
+    let _ = feed(var s, [0xFF, 0xFA, 0x1F, 0x00, 0x51, 0x00, 0xFF, 0xF0], var data)
+    test.assert_eq(s.cols, 80)
+
+@test
+fn test_the_window_this_end_reports_can_be_set() [io]
+    var s = telnetsess.tel_client()
+    telnetsess.tel_set_window(var s, 132, 43)
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFD, 0x1F], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFB, 0x1F, 0xFF, 0xFA, 0x1F, 0x00, 0x84, 0x00, 0x2B, 0xFF, 0xF0])
+
+@test
+fn test_a_client_answers_terminal_type_and_speed_requests() [io]
+    var s = telnetsess.tel_client()
+    telnetsess.tel_set_terminal(var s, "ANSI", 38400, 9600)
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFD, 0x18, 0xFF, 0xFD, 0x20], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFB, 0x18, 0xFF, 0xFB, 0x20])
+    let _ = feed(var s, [0xFF, 0xFA, 0x18, 0x01, 0xFF, 0xF0], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFA, 0x18, 0x00, 0x41, 0x4E, 0x53, 0x49, 0xFF, 0xF0])
+    let _ = feed(var s, [0xFF, 0xFA, 0x20, 0x01, 0xFF, 0xF0], var data)
+    test.assert_eq(drain(var s),
+                   [0xFF, 0xFA, 0x20, 0x00, 0x33, 0x38, 0x34, 0x30, 0x30, 0x2C, 0x39, 0x36, 0x30, 0x30, 0xFF, 0xF0])
+
+@test
+fn test_a_request_for_an_option_that_is_off_is_not_answered() [io]
+    var s = telnetsess.tel_client()
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFA, 0x18, 0x01, 0xFF, 0xF0, 0xFF, 0xFA, 0x20, 0x01, 0xFF, 0xF0], var data)
+    test.assert_eq(drain(var s), [])
+    // An empty or unknown TERMINAL-TYPE subnegotiation is just delivered.
+    let ev = feed(var s, [0xFF, 0xFA, 0x18, 0xFF, 0xF0], var data)
+    test.assert_eq(ev, [[telnetsess.TEL_EV_SUBNEG, 24]])
+    let ev2 = feed(var s, [0xFF, 0xFA, 0x20, 0xFF, 0xF0], var data)
+    test.assert_eq(ev2, [[telnetsess.TEL_EV_SUBNEG, 32]])
+
+@test
+fn test_a_server_asks_for_the_type_and_speed_when_they_come_on_and_keeps_the_answers() [io]
+    var s = telnetsess.tel_server()
+    var data: [Int] = []
+    let _ = feed(var s, [0xFF, 0xFB, 0x18, 0xFF, 0xFB, 0x20], var data)
+    test.assert_eq(drain(var s), [0xFF, 0xFD, 0x18, 0xFF, 0xFA, 0x18, 0x01, 0xFF, 0xF0,
+                                  0xFF, 0xFD, 0x20, 0xFF, 0xFA, 0x20, 0x01, 0xFF, 0xF0])
+    let _ = feed(var s, [0xFF, 0xFA, 0x18, 0x00, 0x56, 0x54, 0x31, 0x30, 0x30, 0xFF, 0xF0], var data)
+    test.assert_eq(s.peer_ttype.len(), 5)
+    test.assert_eq(s.peer_ttype[0], 0x56)
+    let _ = feed(var s,
+        [0xFF, 0xFA, 0x20, 0x00, 0x39, 0x36, 0x30, 0x30, 0x2C, 0x31, 0x32, 0x30, 0x30, 0xFF, 0xF0],
+        var data)
+    test.assert_eq(s.peer_tx, 9600)
+    test.assert_eq(s.peer_rx, 1200)
+    // A speed that is not two numbers leaves the stored one alone.
+    let _ = feed(var s, [0xFF, 0xFA, 0x20, 0x00, 0x39, 0xFF, 0xF0], var data)
+    test.assert_eq(s.peer_tx, 9600)
+
+// ── A server and a client against each other ───────────────────────
+
+@test
+fn test_a_server_and_a_client_negotiate_to_rest() [io]
+    var server = telnetsess.tel_server()
+    var client = telnetsess.tel_client()
+    telnetsess.tel_set_terminal(var client, "VT100", 115200, 115200)
+    telnetsess.tel_set_window(var client, 100, 30)
+    telnetsess.tel_start(var server)
+    let rounds = pump(var server, var client)
+    test.assert_eq(rounds <= 6, true)
+    // The server echoes and suppresses go-ahead; the client reports its
+    // window, type and speed.
+    test.assert_eq(telnetsess.tel_is_on(server, telnetsess.TEL_US, 1), true)
+    test.assert_eq(telnetsess.tel_is_on(server, telnetsess.TEL_US, 3), true)
+    test.assert_eq(telnetsess.tel_is_on(client, telnetsess.TEL_HIM, 1), true)
+    test.assert_eq(telnetsess.tel_is_on(client, telnetsess.TEL_HIM, 3), true)
+    test.assert_eq(telnetsess.tel_is_on(server, telnetsess.TEL_HIM, 31), true)
+    test.assert_eq(telnetsess.tel_is_on(client, telnetsess.TEL_US, 31), true)
+    test.assert_eq(server.cols, 100)
+    test.assert_eq(server.rows, 30)
+    test.assert_eq(server.peer_ttype.len(), 5)
+    test.assert_eq(server.peer_tx, 115200)
+    test.assert_eq(server.peer_rx, 115200)
+    // A second pass has nothing to say.
+    test.assert_eq(pump(var server, var client), 0)
+
+@test
+fn test_text_goes_both_ways() [io]
+    var server = telnetsess.tel_server()
+    var client = telnetsess.tel_client()
+    var out: telnetwire.TelBuf = Vec.new()
+    for b in [0x6C, 0x73, 0x0D, 0x0A, 0xFF]
+        let _ = telnetsess.tel_data(var client, b, var out)
+    var got: [Int] = []
+    for i in 0..out.len()
+        let _ = telnetsess.tel_rx_byte(var server, out[i] as Int)
+        if server.state == 0 and server.data != 0
+            list.push(got, server.data)
+    test.assert_eq(got, [0x6C, 0x73, 0x0D, 0x0A, 0xFF])

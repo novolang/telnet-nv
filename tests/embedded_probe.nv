@@ -1,0 +1,253 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A SERIAL-PORT SERVER: a Cortex-M with a network link and a
+// UART that offers the UART to a program elsewhere, the way a terminal server
+// does, with no heap.  The network side speaks Telnet with RFC 2217
+// COM-PORT-CONTROL: the program on the other end sets the baud rate and the
+// data size, the device applies them to its port, and the bytes of the port
+// travel as Telnet data.  Everything the device decides is here and is
+// compiled for the hardware rather than claimed.
+//
+// The self-test plays both ends from the same package, passing the bytes
+// between a server session and a client session in memory.  What it checks,
+// with the number of checks each adds:
+//
+//   - a client answers the opening of the BusyBox telnet daemon, twelve bytes,
+//     with the replies worked out from RFC 1143: WONT ECHO, WILL NAWS with the
+//     window, DO ECHO and DO SGA (2)
+//   - a server and a client negotiate ECHO, SUPPRESS-GO-AHEAD, NAWS,
+//     TERMINAL-TYPE and TERMINAL-SPEED, and the server knows the window and
+//     the terminal type (4)
+//   - a line of data with a lone CR and a byte of 255 crosses with the NVT
+//     rules applied (2)
+//   - the client asks for 115200 baud and 7 data bits; the server's port
+//     changes and the client's mirror agrees (3)
+//   - the server reports a modem-state change and the client sees it (1)
+//   - the arena was asked for no bytes while it ran (1)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.  After the self-test the firmware runs the bridge: it takes
+// the Telnet stream from the UART, hands the data bytes back (the port is a
+// loopback here) and applies the COM-PORT requests to its port.
+
+use std.str
+use telnetcom
+use telnetsess
+use telnetwire
+
+// Feed what `from` has queued to `to`, and answer the number of data bytes
+// that arrived at `to`.
+@tier(embedded)
+@no_alloc
+fn carry(var from: TelnetSession, var to: TelnetSession) -> Int []
+    var data = 0
+    for _i in 0..TEL_BUF_MAX
+        let b = telnetsess.tel_tx_next(var from)
+        if b >= 0
+            if telnetsess.tel_rx_byte(var to, b) == telnetsess.TEL_EV_DATA
+                data = data + 1
+    data
+
+// Pump the two until neither has anything to say.
+@tier(embedded)
+@no_alloc
+fn settle(var a: TelnetSession, var b: TelnetSession) []
+    for _i in 0..8
+        let _ = carry(var a, var b)
+        let _ = carry(var b, var a)
+
+// The BusyBox opening, answered: two checks.
+@tier(embedded)
+@no_alloc
+fn busybox_score() -> Int []
+    var n = 0
+    var c = telnetsess.tel_client()
+    let opening = 12
+    // IAC DO ECHO, IAC DO NAWS, IAC WILL ECHO, IAC WILL SGA.
+    for i in 0..opening
+        var b = 0
+        if i % 3 == 0
+            b = 255
+        elif i % 3 == 1
+            b = 253
+            if i >= 6
+                b = 251
+        else
+            b = 1
+            if i == 5
+                b = 31
+            if i == 11
+                b = 3
+        let _ = telnetsess.tel_rx_byte(var c, b)
+    var sent: Vec[u8; 40] = Vec.new()
+    for _i in 0..40
+        let b = telnetsess.tel_tx_next(var c)
+        if b >= 0
+            let _ = sent.push(b as u8)
+    // WONT ECHO first (FF FC 01), then WILL NAWS (FF FB 1F) and its window,
+    // 21 bytes in all: 3 + 3 + 9 + 3 + 3.
+    if sent.len() == 21 and sent[0] == 255 and sent[1] == 252 and sent[2] == 1
+        n = n + 1
+    if sent[3] == 255 and sent[4] == 251 and sent[5] == 31 and sent[15] == 255 and sent[16] == 253 and sent[18] == 255
+        n = n + 1
+    n
+
+// The two ends negotiate: four checks.
+@tier(embedded)
+@no_alloc
+fn negotiate_score(var server: TelnetSession, var client: TelnetSession) -> Int []
+    var n = 0
+    telnetsess.tel_set_terminal(var client, "VT100", 115200, 115200)
+    telnetsess.tel_set_window(var client, 100, 30)
+    telnetsess.tel_start(var server)
+    settle(var server, var client)
+    if telnetsess.tel_is_on(server, TEL_US, TELOPT_ECHO) and telnetsess.tel_is_on(client, TEL_HIM, TELOPT_ECHO)
+        n = n + 1
+    if telnetsess.tel_is_on(server, TEL_US, TELOPT_SGA) and telnetsess.tel_is_on(client, TEL_HIM, TELOPT_SGA)
+        n = n + 1
+    if server.cols == 100 and server.rows == 30
+        n = n + 1
+    if server.peer_ttype.len() == 5 and server.peer_tx == 115200
+        n = n + 1
+    n
+
+// A line of data across: two checks.
+@tier(embedded)
+@no_alloc
+fn data_score(var server: TelnetSession, var client: TelnetSession) -> Int []
+    var n = 0
+    var out: TelBuf = Vec.new()
+    // 'a', a lone CR, 'b', 255, CR LF.
+    let _ = telnetsess.tel_data(var client, 97, var out)
+    let _ = telnetsess.tel_data(var client, 13, var out)
+    let _ = telnetsess.tel_data(var client, 98, var out)
+    let _ = telnetsess.tel_data(var client, 255, var out)
+    let _ = telnetsess.tel_data(var client, 13, var out)
+    let _ = telnetsess.tel_data(var client, 10, var out)
+    if out.len() == 8 and out[2] == 0 and out[4] == 255 and out[5] == 255
+        n = n + 1
+    var got = 0
+    var last = 0
+    for i in 0..out.len()
+        if telnetsess.tel_rx_byte(var server, out[i] as Int) == telnetsess.TEL_EV_DATA
+            got = got + 1
+            last = server.data
+    if got == 6 and last == 10
+        n = n + 1
+    n
+
+// The server hands a COM-PORT subnegotiation to its port, and the client to
+// its mirror.
+@tier(embedded)
+@no_alloc
+fn port_step(var s: TelnetSession, var port: ComPort, var wire: TelBuf, var replies: TelBuf) []
+    for i in 0..wire.len()
+        if telnetsess.tel_rx_byte(var s, wire[i] as Int) == telnetsess.TEL_EV_SUBNEG
+            if s.sb_opt == TELOPT_COM_PORT
+                let _ = telnetcom.com_handle(var port, var s.sub, var replies)
+
+// The serial-port requests: three checks for the settings and one for a
+// notification.
+@tier(embedded)
+@no_alloc
+fn com_score(var server: TelnetSession, var client: TelnetSession) -> Int []
+    var n = 0
+    var real = telnetcom.com_new()
+    var mirror = telnetcom.com_new()
+    var req: TelBuf = Vec.new()
+    let _ = telnetcom.com_set_baud(var req, 115200)
+    let _ = telnetcom.com_set_datasize(var req, 7)
+    var replies: TelBuf = Vec.new()
+    port_step(var server, var real, var req, var replies)
+    if real.baud == 115200 and real.datasize == 7
+        n = n + 1
+    var none: TelBuf = Vec.new()
+    port_step(var client, var mirror, var replies, var none)
+    if mirror.baud == 115200 and mirror.datasize == 7
+        n = n + 1
+    if replies.len() == 10 + 7 and none.len() == 0
+        n = n + 1
+    var note: TelBuf = Vec.new()
+    if telnetcom.com_notify_modemstate(var real, 0x11, var note)
+        var sink: TelBuf = Vec.new()
+        port_step(var client, var mirror, var note, var sink)
+        if mirror.modemstate == 0x11
+            n = n + 1
+    n
+
+// Every answer the probe checks, in the frame, with the arena counted.
+@tier(rt)
+fn selftest(var parts: Vec[Int; 5]) -> Int [hw]
+    let h0 = core.rt.heap_alloced()
+    var server = telnetsess.tel_server()
+    var client = telnetsess.tel_client()
+    let a = busybox_score()
+    let b = negotiate_score(var server, var client)
+    let c = data_score(var server, var client)
+    let d = com_score(var server, var client)
+    var e = 0
+    if core.rt.heap_alloced() == h0
+        e = 1
+    parts.clear()
+    let _ = parts.push(a)
+    let _ = parts.push(b)
+    let _ = parts.push(c)
+    let _ = parts.push(d)
+    let _ = parts.push(e)
+    a + b + c + d + e
+
+// Send the bytes the session has queued to the stream.
+@tier(rt)
+fn flush(var s: TelnetSession) [hw]
+    for _i in 0..TEL_BUF_MAX
+        let b = telnetsess.tel_tx_next(var s)
+        if b >= 0
+            hal.uart.write_byte(b)
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 13 is the number of checks in the parts above.  The count is printed on
+    // a failure rather than only compared, so a device that disagrees with the
+    // host says how many it lost.
+    var parts: Vec[Int; 5] = Vec.new()
+    let n = selftest(var parts)
+    if n == 13
+        hal.uart.write("PASS: telnet-embedded\n")
+    else
+        hal.uart.write("FAIL: telnet-embedded busybox=")
+        hal.uart.write(str.from_int(parts[0]))
+        hal.uart.write(" negotiate=")
+        hal.uart.write(str.from_int(parts[1]))
+        hal.uart.write(" data=")
+        hal.uart.write(str.from_int(parts[2]))
+        hal.uart.write(" com=")
+        hal.uart.write(str.from_int(parts[3]))
+        hal.uart.write(" arena=")
+        hal.uart.write(str.from_int(parts[4]))
+        hal.uart.write("\n")
+    // The bridge: the Telnet stream arrives on the UART, the data bytes are
+    // sent back, and the COM-PORT requests change the port.
+    var s = telnetsess.tel_server()
+    var port = telnetcom.com_new()
+    telnetsess.tel_start(var s)
+    flush(var s)
+    loop
+        let b = hal.uart.try_read_byte()
+        if b >= 0
+            let ev = telnetsess.tel_rx_byte(var s, b)
+            if ev == telnetsess.TEL_EV_DATA
+                var one: TelBuf = Vec.new()
+                let _ = telnetsess.tel_data(var s, s.data, var one)
+                for i in 0..one.len()
+                    hal.uart.write_byte(one[i] as Int)
+            elif ev == telnetsess.TEL_EV_SUBNEG
+                if s.sb_opt == TELOPT_COM_PORT
+                    var reply: TelBuf = Vec.new()
+                    let _ = telnetcom.com_handle(var port, var s.sub, var reply)
+                    for i in 0..reply.len()
+                        hal.uart.write_byte(reply[i] as Int)
+            flush(var s)
+        else
+            hal.timer.delay_ms(1)

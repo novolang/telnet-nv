@@ -1,0 +1,729 @@
+// telnetsess.nv — one end of a Telnet connection, as a step a caller drives,
+// with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A `TelnetSession` is a
+// `@value` the caller holds in a `var`.  The caller moves the bytes: it gives
+// each byte it reads from the connection to `tel_rx_byte`, writes the bytes
+// `tel_tx_next` hands back, and passes the data it wants sent through
+// `tel_data`.  The session owns no socket and no clock.
+//
+// THE STREAM.  `tel_rx_byte` separates the data of the Network Virtual
+// Terminal from the control that is mixed into it.  It answers one event for
+// each byte:
+//
+//   `TEL_EV_NONE`      the byte was part of a command, or was dropped
+//   `TEL_EV_DATA`      a data byte: `s.data`
+//   `TEL_EV_CMD`       a command such as AYT or IP: `s.cmd`
+//   `TEL_EV_OPT_ON`    option `s.opt` came on, for the side `s.side`
+//   `TEL_EV_OPT_OFF`   option `s.opt` went off
+//   `TEL_EV_SUBNEG`    a subnegotiation of option `s.sb_opt` is complete, its
+//                      parameters in `s.sub`
+//   `TEL_EV_SB_ERROR`  a subnegotiation was abandoned or was too long
+//
+// THE NVT RULES, RFC 854.  End of line is CR LF, and a carriage return alone
+// is CR NUL.  Received, CR LF is delivered as the two data bytes, CR NUL as
+// the one data byte CR, and the NUL is dropped.  Sent, `tel_data` puts a NUL
+// after a CR that is not followed by LF.  With the BINARY option on (RFC 856)
+// for a direction, that direction carries bytes as they are, except for the
+// doubling of 255, and the CR rules are off.  A data byte of 255 is IAC IAC.
+//
+// THE OPTIONS.  Each of the nine options this package knows has two states,
+// one for each side, kept by the Q method of `telnetq`: "us" is this end
+// performing the option, "him" is the other end.  `local_ok` and `remote_ok`
+// say which options this end agrees to perform and agrees to let the peer
+// perform; an offer for any other option is answered with WONT or DONT, and
+// an option the package does not know is refused the same way.  `tel_client`
+// and `tel_server` set the masks that suit each role, and `tel_start` sends
+// the opening offers of a server.  `tel_ask` makes a request of this end's
+// own.
+//
+// WHAT THE SESSION ANSWERS BY ITSELF.  When NAWS comes on for this end, it
+// sends the window size set with `tel_set_window`.  When TERMINAL-TYPE or
+// TERMINAL-SPEED comes on for the peer, it asks the peer for it.  When the
+// peer asks for this end's terminal type or speed, it answers with what
+// `tel_set_terminal` set.  What the peer answers is stored: `cols` and `rows`,
+// `peer_ttype`, `peer_tx` and `peer_rx`.  Every other subnegotiation is left to
+// the caller, as an event.
+//
+// THE QUEUE.  The negotiation replies, and the subnegotiations above, go into
+// a queue of 256 bytes that the caller empties with `tel_tx_next` or
+// `tel_tx_drain` after every call of `tel_rx_byte` that answered anything
+// but `TEL_EV_NONE` or `TEL_EV_DATA`.  A reply that does not fit is lost and
+// counted in `tx_lost`.
+
+use std.str
+use telnetopt
+use telnetq
+use telnetwire
+
+// `tel_rx_byte`: nothing to report.
+pub const TEL_EV_NONE = 0
+// `tel_rx_byte`: a data byte, in `s.data`.
+pub const TEL_EV_DATA = 1
+// `tel_rx_byte`: a command, in `s.cmd`.
+pub const TEL_EV_CMD = 2
+// `tel_rx_byte`: an option came on.
+pub const TEL_EV_OPT_ON = 3
+// `tel_rx_byte`: an option went off.
+pub const TEL_EV_OPT_OFF = 4
+// `tel_rx_byte`: a subnegotiation is complete.
+pub const TEL_EV_SUBNEG = 5
+// `tel_rx_byte`: a subnegotiation was abandoned or did not fit.
+pub const TEL_EV_SB_ERROR = 6
+
+// The side of an option that this end performs.
+pub const TEL_US = 0
+// The side of an option that the peer performs.
+pub const TEL_HIM = 1
+
+// The number of options the package keeps state for: 9.
+pub const TEL_OPTS = 9
+
+// The parser is between commands.
+const P_DATA = 0
+// The parser has read IAC.
+const P_IAC = 1
+// The parser has read IAC WILL and wants the option.
+const P_WILL = 2
+// The parser has read IAC WONT.
+const P_WONT = 3
+// The parser has read IAC DO.
+const P_DO = 4
+// The parser has read IAC DONT.
+const P_DONT = 5
+// The parser has read IAC SB and wants the option.
+const P_SB_OPT = 6
+// The parser is inside a subnegotiation.
+const P_SB = 7
+// The parser has read IAC inside a subnegotiation.
+const P_SB_IAC = 8
+
+// One end of a Telnet connection.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct TelnetSession
+    // Whether this end is the server.
+    server: Bool
+    // The parser's state.
+    state: Int
+    // The last data byte delivered.
+    data: Int
+    // The last command delivered.
+    cmd: Int
+    // The option of the last `TEL_EV_OPT_ON` or `TEL_EV_OPT_OFF`.
+    opt: Int
+    // Its side, `TEL_US` or `TEL_HIM`.
+    side: Int
+    // The option of the subnegotiation in `sub`.
+    sb_opt: Int
+    // The parameters of the last subnegotiation.
+    sub: TelSb
+    // Whether the subnegotiation being read has outgrown `sub`.
+    sb_over: Bool
+    // Whether the last received data byte was a CR.
+    rx_cr: Bool
+    // Whether the last data byte sent was a CR whose NUL or LF is owed.
+    tx_cr: Bool
+    // The Q state of each option for the side this end performs.
+    us: Vec[Int; 9]
+    // The Q state of each option for the side the peer performs.
+    him: Vec[Int; 9]
+    // The options this end agrees to perform, a bit for each slot.
+    local_ok: Int
+    // The options this end agrees to let the peer perform.
+    remote_ok: Int
+    // The bytes waiting to be sent.
+    queue: TelBuf
+    // The index of the next byte of `queue` to take.
+    qhead: Int
+    // Replies that did not fit the queue.
+    tx_lost: Int
+    // The window this end reports.
+    my_cols: Int
+    // The window this end reports.
+    my_rows: Int
+    // The terminal type this end reports.
+    my_ttype: Vec[u8; 40]
+    // The terminal speed this end reports, transmit.
+    my_tx: Int
+    // The terminal speed this end reports, receive.
+    my_rx: Int
+    // The peer's window width, from NAWS; 0 until it reports.
+    cols: Int
+    // The peer's window height.
+    rows: Int
+    // The peer's terminal type, from TERMINAL-TYPE.
+    peer_ttype: Vec[u8; 40]
+    // The peer's transmit speed, from TERMINAL-SPEED; 0 until it reports.
+    peer_tx: Int
+    // The peer's receive speed.
+    peer_rx: Int
+
+// The slot of an option, 0 to 8, or -1 for an option the package does not
+// know.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     println("${telnetsess.tel_slot(1)} ${telnetsess.tel_slot(31)} ${telnetsess.tel_slot(99)}")   // 1 5 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_slot(opt: Int) -> Int []
+    if opt == TELOPT_BINARY
+        return 0
+    if opt == TELOPT_ECHO
+        return 1
+    if opt == TELOPT_SGA
+        return 2
+    if opt == TELOPT_TTYPE
+        return 3
+    if opt == TELOPT_EOR
+        return 4
+    if opt == TELOPT_NAWS
+        return 5
+    if opt == TELOPT_TSPEED
+        return 6
+    if opt == TELOPT_NEW_ENVIRON
+        return 7
+    if opt == TELOPT_COM_PORT
+        return 8
+    -1
+
+// The bit of an option in a mask of agreed options, or 0 for an option the
+// package does not know.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     println("${telnetsess.tel_bit(0)} ${telnetsess.tel_bit(3)} ${telnetsess.tel_bit(99)}")   // 1 4 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_bit(opt: Int) -> Int []
+    let slot = tel_slot(opt)
+    if slot < 0
+        return 0
+    1 << slot
+
+// A session with the masks of a role and nothing agreed.
+@tier(embedded)
+@no_alloc
+fn make(server: Bool, local_ok: Int, remote_ok: Int) -> TelnetSession []
+    var us: Vec[Int; 9] = Vec.new()
+    var him: Vec[Int; 9] = Vec.new()
+    for _i in 0..TEL_OPTS
+        let _ = us.push(Q_NO)
+        let _ = him.push(Q_NO)
+    TelnetSession { server: server, state: P_DATA, data: 0, cmd: 0, opt: 0, side: 0, sb_opt: 0,
+                    sub: Vec.new(), sb_over: false, rx_cr: false, tx_cr: false, us: us, him: him,
+                    local_ok: local_ok, remote_ok: remote_ok, queue: Vec.new(), qhead: 0,
+                    tx_lost: 0, my_cols: 80, my_rows: 24, my_ttype: Vec.new(), my_tx: 0, my_rx: 0,
+                    cols: 0, rows: 0, peer_ttype: Vec.new(), peer_tx: 0, peer_rx: 0 }
+
+// The client end of a connection.  It agrees to perform BINARY, SGA, TERMINAL-TYPE,
+// NAWS, TERMINAL-SPEED and NEW-ENVIRON, and to let the server perform BINARY,
+// ECHO, SGA, END-OF-RECORD and COM-PORT-CONTROL.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     let s = telnetsess.tel_client()
+//     println("${s.server} ${s.local_ok} ${s.remote_ok}")   // false 237 279
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_client() -> TelnetSession []
+    let local = tel_bit(TELOPT_BINARY) | tel_bit(TELOPT_SGA) | tel_bit(TELOPT_TTYPE) | tel_bit(TELOPT_NAWS)
+        | tel_bit(TELOPT_TSPEED) | tel_bit(TELOPT_NEW_ENVIRON)
+    let remote = tel_bit(TELOPT_BINARY) | tel_bit(TELOPT_ECHO) | tel_bit(TELOPT_SGA) | tel_bit(TELOPT_EOR)
+        | tel_bit(TELOPT_COM_PORT)
+    make(false, local, remote)
+
+// The server end of a connection.  It agrees to perform BINARY, ECHO, SGA,
+// END-OF-RECORD and COM-PORT-CONTROL, and to let the client perform BINARY,
+// SGA, TERMINAL-TYPE, NAWS, TERMINAL-SPEED and NEW-ENVIRON.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     let s = telnetsess.tel_server()
+//     println("${s.server} ${s.local_ok} ${s.remote_ok}")   // true 279 237
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_server() -> TelnetSession []
+    let remote = tel_bit(TELOPT_BINARY) | tel_bit(TELOPT_SGA) | tel_bit(TELOPT_TTYPE) | tel_bit(TELOPT_NAWS)
+        | tel_bit(TELOPT_TSPEED) | tel_bit(TELOPT_NEW_ENVIRON)
+    let local = tel_bit(TELOPT_BINARY) | tel_bit(TELOPT_ECHO) | tel_bit(TELOPT_SGA) | tel_bit(TELOPT_EOR)
+        | tel_bit(TELOPT_COM_PORT)
+    make(true, local, remote)
+
+// Set the window this end reports in NAWS.  The default is 80 by 24.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     telnetsess.tel_set_window(var s, 132, 50)
+//     println("${s.my_cols} ${s.my_rows}")   // 132 50
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_set_window(var s: TelnetSession, cols: Int, rows: Int) []
+    s.my_cols = cols
+    s.my_rows = rows
+
+// Set the terminal type and the speeds this end reports.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     telnetsess.tel_set_terminal(var s, "VT100", 9600, 9600)
+//     println("${s.my_ttype.len()} ${s.my_tx}")   // 5 9600
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_set_terminal(var s: TelnetSession, ttype: Str, tx: Int, rx: Int) []
+    s.my_ttype.clear()
+    for i in 0..str.len(ttype)
+        let _ = s.my_ttype.push(str.byte_at_or(ttype, i, 0) as u8)
+    s.my_tx = tx
+    s.my_rx = rx
+
+// Whether option `opt` is in force for `side` (`TEL_US` or `TEL_HIM`).
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     let s = telnetsess.tel_server()
+//     println("${telnetsess.tel_is_on(s, telnetsess.TEL_US, 1)}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_is_on(s: TelnetSession, side: Int, opt: Int) -> Bool []
+    let slot = tel_slot(opt)
+    if slot < 0
+        return false
+    if side == TEL_US
+        return telnetq.q_on(s.us[slot])
+    telnetq.q_on(s.him[slot])
+
+// Append a negotiation to the queue; lose it, and count it, when it does not
+// fit.
+@tier(embedded)
+@no_alloc
+fn queue_neg(var s: TelnetSession, verb: Int, opt: Int) []
+    if not telnetwire.put_negotiate(var s.queue, verb, opt)
+        s.tx_lost = s.tx_lost + 1
+
+// Queue the reply of the Q method for the side `side` of the option.
+@tier(embedded)
+@no_alloc
+fn queue_reply(var s: TelnetSession, side: Int, reply: Int, opt: Int) []
+    if reply == Q_REPLY_NONE
+        return
+    if side == TEL_US
+        if reply == Q_REPLY_ON
+            queue_neg(var s, TEL_WILL, opt)
+        else
+            queue_neg(var s, TEL_WONT, opt)
+    elif reply == Q_REPLY_ON
+        queue_neg(var s, TEL_DO, opt)
+    else
+        queue_neg(var s, TEL_DONT, opt)
+
+// Queue a subnegotiation built by `build`'s result: `ok` says whether it fitted.
+@tier(embedded)
+@no_alloc
+fn count_lost(var s: TelnetSession, ok: Bool) []
+    if not ok
+        s.tx_lost = s.tx_lost + 1
+
+// Queue the window size.
+@tier(embedded)
+@no_alloc
+fn queue_naws(var s: TelnetSession) []
+    count_lost(var s, telnetopt.naws(var s.queue, s.my_cols, s.my_rows))
+
+// What an option coming on makes this end do by itself.
+@tier(embedded)
+@no_alloc
+fn on_option_on(var s: TelnetSession, side: Int, opt: Int) []
+    if side == TEL_US and opt == TELOPT_NAWS
+        queue_naws(var s)
+    if side == TEL_HIM and opt == TELOPT_TTYPE
+        count_lost(var s, telnetopt.ttype_send(var s.queue))
+    if side == TEL_HIM and opt == TELOPT_TSPEED
+        count_lost(var s, telnetopt.tspeed_send(var s.queue))
+
+// Move the Q state of a side of an option, queue the reply and answer the
+// event: `TEL_EV_OPT_ON`, `TEL_EV_OPT_OFF` or `TEL_EV_NONE`.
+@tier(embedded)
+@no_alloc
+fn settle(var s: TelnetSession, side: Int, opt: Int, slot: Int, old: Int, r: Int) -> Int []
+    let state = telnetq.q_state(r)
+    if side == TEL_US
+        s.us[slot] = state
+    else
+        s.him[slot] = state
+    queue_reply(var s, side, telnetq.q_reply(r), opt)
+    s.opt = opt
+    s.side = side
+    if not telnetq.q_on(old) and telnetq.q_on(state)
+        on_option_on(var s, side, opt)
+        return TEL_EV_OPT_ON
+    if telnetq.q_on(old) and not telnetq.q_on(state)
+        return TEL_EV_OPT_OFF
+    TEL_EV_NONE
+
+// A WILL, WONT, DO or DONT arrived for `opt`.
+@tier(embedded)
+@no_alloc
+fn negotiate(var s: TelnetSession, verb: Int, opt: Int) -> Int []
+    let slot = tel_slot(opt)
+    if slot < 0
+        if verb == TEL_WILL
+            queue_neg(var s, TEL_DONT, opt)
+        elif verb == TEL_DO
+            queue_neg(var s, TEL_WONT, opt)
+        return TEL_EV_NONE
+    let bit = 1 << slot
+    if verb == TEL_DO
+        let old = s.us[slot]
+        return settle(var s, TEL_US, opt, slot, old, telnetq.q_peer_on(old, (s.local_ok & bit) != 0))
+    if verb == TEL_DONT
+        let old = s.us[slot]
+        return settle(var s, TEL_US, opt, slot, old, telnetq.q_peer_off(old))
+    if verb == TEL_WILL
+        let old = s.him[slot]
+        return settle(var s, TEL_HIM, opt, slot, old, telnetq.q_peer_on(old, (s.remote_ok & bit) != 0))
+    let old = s.him[slot]
+    settle(var s, TEL_HIM, opt, slot, old, telnetq.q_peer_off(old))
+
+// Ask for an option from this end's side: `verb` is `TEL_DO` or `TEL_DONT`
+// (the peer is asked to perform or not to perform it) or `TEL_WILL` or
+// `TEL_WONT` (this end offers to, or declines to).  Answers false for an
+// option the package does not know or a verb that is not one of the four.
+// The request is queued if the Q method sends one, and the call answers the
+// event that the request itself caused, which it does not: the option comes on
+// when the answer arrives.
+//
+// ```novo
+// use telnetsess
+// use telnetwire
+//
+// fn main() [io]
+//     var s = telnetsess.tel_server()
+//     let ok = telnetsess.tel_ask(var s, telnetwire.TEL_WILL, telnetwire.TELOPT_ECHO)
+//     println("${ok} ${telnetsess.tel_tx_next(var s)} ${telnetsess.tel_tx_next(var s)} ${telnetsess.tel_tx_next(var s)}")   // true 255 251 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_ask(var s: TelnetSession, verb: Int, opt: Int) -> Bool []
+    let slot = tel_slot(opt)
+    if slot < 0
+        return false
+    if verb == TEL_DO
+        let r = telnetq.q_ask_on(s.him[slot])
+        s.him[slot] = telnetq.q_state(r)
+        queue_reply(var s, TEL_HIM, telnetq.q_reply(r), opt)
+        return true
+    if verb == TEL_DONT
+        let r = telnetq.q_ask_off(s.him[slot])
+        s.him[slot] = telnetq.q_state(r)
+        queue_reply(var s, TEL_HIM, telnetq.q_reply(r), opt)
+        return true
+    if verb == TEL_WILL
+        let r = telnetq.q_ask_on(s.us[slot])
+        s.us[slot] = telnetq.q_state(r)
+        queue_reply(var s, TEL_US, telnetq.q_reply(r), opt)
+        return true
+    if verb == TEL_WONT
+        let r = telnetq.q_ask_off(s.us[slot])
+        s.us[slot] = telnetq.q_state(r)
+        queue_reply(var s, TEL_US, telnetq.q_reply(r), opt)
+        return true
+    false
+
+// Send the opening offers of this end's role.  A server offers ECHO and
+// SUPPRESS-GO-AHEAD and asks for NAWS, TERMINAL-TYPE and TERMINAL-SPEED, as
+// the classic servers do; a client sends nothing and waits to be asked.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_server()
+//     telnetsess.tel_start(var s)
+//     println("${s.queue.len()}")   // 15
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_start(var s: TelnetSession) []
+    if s.server
+        let _ = tel_ask(var s, TEL_WILL, TELOPT_ECHO)
+        let _ = tel_ask(var s, TEL_WILL, TELOPT_SGA)
+        let _ = tel_ask(var s, TEL_DO, TELOPT_NAWS)
+        let _ = tel_ask(var s, TEL_DO, TELOPT_TTYPE)
+        let _ = tel_ask(var s, TEL_DO, TELOPT_TSPEED)
+
+// The next byte to send, or -1 when none is waiting.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     println("${telnetsess.tel_tx_next(var s)}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_tx_next(var s: TelnetSession) -> Int []
+    if s.qhead >= s.queue.len()
+        s.queue.clear()
+        s.qhead = 0
+        return -1
+    let b = s.queue[s.qhead] as Int
+    s.qhead = s.qhead + 1
+    b
+
+// Move the waiting bytes to the end of `out`, as many as fit, and answer how
+// many were moved.
+//
+// ```novo
+// use telnetsess
+// use telnetwire
+//
+// fn main() [io]
+//     var s = telnetsess.tel_server()
+//     telnetsess.tel_start(var s)
+//     var out: telnetwire.TelBuf = Vec.new()
+//     println("${telnetsess.tel_tx_drain(var s, var out)} ${out.len()}")   // 15 15
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_tx_drain(var s: TelnetSession, var out: TelBuf) -> Int []
+    var n = 0
+    for _i in 0..TEL_BUF_MAX
+        if s.qhead < s.queue.len() and out.len() < TEL_BUF_MAX
+            let _ = out.push(s.queue[s.qhead])
+            s.qhead = s.qhead + 1
+            n = n + 1
+    if s.qhead >= s.queue.len()
+        s.queue.clear()
+        s.qhead = 0
+    n
+
+// Whether bytes are waiting to be sent.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_server()
+//     println("${telnetsess.tel_tx_pending(s)}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_tx_pending(s: TelnetSession) -> Bool []
+    s.qhead < s.queue.len()
+
+// Append the NVT form of one data byte to `out`: IAC doubled, a NUL owed after
+// a CR that no LF follows.  With BINARY on for this end's side the byte goes
+// as it is.  Answers false, and writes nothing, when it does not fit.
+//
+// ```novo
+// use telnetsess
+// use telnetwire
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     var out: telnetwire.TelBuf = Vec.new()
+//     for b in [72, 13, 10, 13, 65, 255]
+//         let _ = telnetsess.tel_data(var s, b, var out)
+//     println("${out.len()}")   // 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_data(var s: TelnetSession, b: Int, var out: TelBuf) -> Bool []
+    let c = b & 0xFF
+    let mark = out.len()
+    let binary = telnetq.q_on(s.us[0])
+    var ok = true
+    if s.tx_cr and not binary and c != 10
+        ok = telnetwire.put_byte(var out, 0)
+    if c == TEL_IAC
+        ok = ok and telnetwire.put_byte(var out, TEL_IAC) and telnetwire.put_byte(var out, TEL_IAC)
+    else
+        ok = ok and telnetwire.put_byte(var out, c)
+    if not ok
+        telnetwire.rollback(var out, mark)
+        return false
+    s.tx_cr = c == 13 and not binary
+    true
+
+// Finish a run of data: append the NUL that a trailing CR is owed.
+//
+// ```novo
+// use telnetsess
+// use telnetwire
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let _ = telnetsess.tel_data(var s, 13, var out)
+//     let _ = telnetsess.tel_flush(var s, var out)
+//     println("${out.len()} ${out[1]}")   // 2 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_flush(var s: TelnetSession, var out: TelBuf) -> Bool []
+    if not s.tx_cr
+        return true
+    if telnetwire.put_byte(var out, 0)
+        s.tx_cr = false
+        return true
+    false
+
+// Handle a data byte: the NVT rules for a CR.
+@tier(embedded)
+@no_alloc
+fn rx_data(var s: TelnetSession, c: Int) -> Int []
+    let binary = telnetq.q_on(s.him[0])
+    if not binary
+        if s.rx_cr
+            s.rx_cr = false
+            if c == 0
+                return TEL_EV_NONE
+        if c == 13
+            s.rx_cr = true
+    s.data = c
+    TEL_EV_DATA
+
+// Store a byte of a subnegotiation.
+@tier(embedded)
+@no_alloc
+fn sb_store(var s: TelnetSession, c: Int) []
+    if s.sub.len() < TEL_SB_MAX
+        let _ = s.sub.push(c as u8)
+    else
+        s.sb_over = true
+
+// A subnegotiation is complete: act on the ones this end answers for itself.
+@tier(embedded)
+@no_alloc
+fn sb_done(var s: TelnetSession) -> Int []
+    if s.sb_over
+        return TEL_EV_SB_ERROR
+    if s.sb_opt == TELOPT_NAWS and telnetq.q_on(s.him[5]) and s.sub.len() == 4
+        s.cols = telnetopt.sb_naws_cols(var s.sub)
+        s.rows = telnetopt.sb_naws_rows(var s.sub)
+    elif s.sb_opt == TELOPT_TTYPE and s.sub.len() >= 1
+        if s.sub[0] == TEL_SEND and telnetq.q_on(s.us[3])
+            count_lost(var s, telnetopt.ttype_is_bytes(var s.queue, var s.my_ttype))
+        elif s.sub[0] == TEL_IS and telnetq.q_on(s.him[3])
+            let _ = telnetopt.sb_ttype_name(var s.sub, var s.peer_ttype)
+    elif s.sb_opt == TELOPT_TSPEED and s.sub.len() >= 1
+        if s.sub[0] == TEL_SEND and telnetq.q_on(s.us[6])
+            count_lost(var s, telnetopt.tspeed_is(var s.queue, s.my_tx, s.my_rx))
+        elif s.sub[0] == TEL_IS and telnetq.q_on(s.him[6])
+            let tx = telnetopt.sb_tspeed_tx(var s.sub)
+            let rx = telnetopt.sb_tspeed_rx(var s.sub)
+            if tx >= 0 and rx >= 0
+                s.peer_tx = tx
+                s.peer_rx = rx
+    TEL_EV_SUBNEG
+
+// The byte after IAC.
+@tier(embedded)
+@no_alloc
+fn rx_iac(var s: TelnetSession, c: Int) -> Int []
+    s.state = P_DATA
+    if c == TEL_IAC
+        s.rx_cr = false
+        s.data = TEL_IAC
+        return TEL_EV_DATA
+    if c == TEL_WILL
+        s.state = P_WILL
+    elif c == TEL_WONT
+        s.state = P_WONT
+    elif c == TEL_DO
+        s.state = P_DO
+    elif c == TEL_DONT
+        s.state = P_DONT
+    elif c == TEL_SB
+        s.state = P_SB_OPT
+    elif c >= TEL_EOR and c <= TEL_GA and c != TEL_SE
+        s.cmd = c
+        return TEL_EV_CMD
+    TEL_EV_NONE
+
+// Give the session one byte from the connection and answer what it was:
+// `TEL_EV_NONE`, `TEL_EV_DATA`, `TEL_EV_CMD`, `TEL_EV_OPT_ON`,
+// `TEL_EV_OPT_OFF`, `TEL_EV_SUBNEG` or `TEL_EV_SB_ERROR`.
+//
+// ```novo
+// use telnetsess
+//
+// fn main() [io]
+//     var s = telnetsess.tel_client()
+//     var data = 0
+//     // "A", then IAC IAC (a data byte of 255).
+//     for b in [65, 255, 255]
+//         if telnetsess.tel_rx_byte(var s, b) == telnetsess.TEL_EV_DATA
+//             data = data + s.data
+//     println("${data}")   // 320
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tel_rx_byte(var s: TelnetSession, b: Int) -> Int []
+    let c = b & 0xFF
+    let st = s.state
+    if st == P_DATA
+        if c == TEL_IAC
+            s.state = P_IAC
+            return TEL_EV_NONE
+        return rx_data(var s, c)
+    if st == P_IAC
+        return rx_iac(var s, c)
+    if st >= P_WILL and st <= P_DONT
+        s.state = P_DATA
+        var verb = TEL_WILL
+        if st == P_WONT
+            verb = TEL_WONT
+        elif st == P_DO
+            verb = TEL_DO
+        elif st == P_DONT
+            verb = TEL_DONT
+        return negotiate(var s, verb, c)
+    if st == P_SB_OPT
+        s.sb_opt = c
+        s.sub.clear()
+        s.sb_over = false
+        s.state = P_SB
+        return TEL_EV_NONE
+    if st == P_SB
+        if c == TEL_IAC
+            s.state = P_SB_IAC
+        else
+            sb_store(var s, c)
+        return TEL_EV_NONE
+    if c == TEL_IAC
+        sb_store(var s, TEL_IAC)
+        s.state = P_SB
+        return TEL_EV_NONE
+    s.state = P_DATA
+    if c == TEL_SE
+        return sb_done(var s)
+    TEL_EV_SB_ERROR

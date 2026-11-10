@@ -1,0 +1,157 @@
+// telnetwire_tests.nv — the sequences of RFC 854 and RFC 855, byte for byte.
+//
+// IAC is 255 (FF).  The commands are NOP 241 (F1), DM 242, BRK 243, IP 244,
+// AO 245, AYT 246 (F6), EC 247, EL 248, GA 249 (F9), SE 240 (F0), SB 250 (FA)
+// and EOR 239 (EF).  The negotiation verbs are WILL 251 (FB), WONT 252 (FC),
+// DO 253 (FD) and DONT 254 (FE).  So
+//
+//     IAC AYT          is  FF F6
+//     IAC WILL ECHO    is  FF FB 01
+//     IAC DONT SGA     is  FF FE 03
+//     IAC SB 24 1 IAC SE  is  FF FA 18 01 FF F0
+//
+// and a parameter byte of 255 inside a subnegotiation is FF FF.
+
+use std.list
+use std.test
+use telnetwire
+
+// The bytes of a buffer as a list.
+fn list_of(var out: telnetwire.TelBuf) -> [Int]
+    var xs: [Int] = []
+    for i in 0..out.len()
+        list.push(xs, out[i] as Int)
+    xs
+
+// A buffer holding `n` bytes of 0x55.
+fn filled(n: Int) -> telnetwire.TelBuf
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..n
+        let _ = out.push(0x55)
+    out
+
+@test
+fn test_the_values_are_those_of_the_rfcs() [io]
+    test.assert_eq(telnetwire.TEL_IAC, 255)
+    test.assert_eq(telnetwire.TEL_DONT, 254)
+    test.assert_eq(telnetwire.TEL_DO, 253)
+    test.assert_eq(telnetwire.TEL_WONT, 252)
+    test.assert_eq(telnetwire.TEL_WILL, 251)
+    test.assert_eq(telnetwire.TEL_SB, 250)
+    test.assert_eq(telnetwire.TEL_GA, 249)
+    test.assert_eq(telnetwire.TEL_EL, 248)
+    test.assert_eq(telnetwire.TEL_EC, 247)
+    test.assert_eq(telnetwire.TEL_AYT, 246)
+    test.assert_eq(telnetwire.TEL_AO, 245)
+    test.assert_eq(telnetwire.TEL_IP, 244)
+    test.assert_eq(telnetwire.TEL_BRK, 243)
+    test.assert_eq(telnetwire.TEL_DM, 242)
+    test.assert_eq(telnetwire.TEL_NOP, 241)
+    test.assert_eq(telnetwire.TEL_SE, 240)
+    test.assert_eq(telnetwire.TEL_EOR, 239)
+    test.assert_eq(telnetwire.TELOPT_BINARY, 0)
+    test.assert_eq(telnetwire.TELOPT_ECHO, 1)
+    test.assert_eq(telnetwire.TELOPT_SGA, 3)
+    test.assert_eq(telnetwire.TELOPT_TTYPE, 24)
+    test.assert_eq(telnetwire.TELOPT_EOR, 25)
+    test.assert_eq(telnetwire.TELOPT_NAWS, 31)
+    test.assert_eq(telnetwire.TELOPT_TSPEED, 32)
+    test.assert_eq(telnetwire.TELOPT_NEW_ENVIRON, 39)
+    test.assert_eq(telnetwire.TELOPT_COM_PORT, 44)
+
+@test
+fn test_a_command_is_iac_and_the_command() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_command(var out, telnetwire.TEL_AYT), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xF6])
+
+@test
+fn test_a_negotiation_is_iac_verb_option() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_negotiate(var out, telnetwire.TEL_WILL, telnetwire.TELOPT_ECHO), true)
+    test.assert_eq(telnetwire.put_negotiate(var out, telnetwire.TEL_DONT, telnetwire.TELOPT_SGA), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFB, 0x01, 0xFF, 0xFE, 0x03])
+
+@test
+fn test_a_subnegotiation_is_sb_option_parameters_se() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_sb_begin(var out, telnetwire.TELOPT_TTYPE), true)
+    test.assert_eq(telnetwire.put_sb_byte(var out, 1), true)
+    test.assert_eq(telnetwire.put_sb_end(var out), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x18, 0x01, 0xFF, 0xF0])
+
+@test
+fn test_a_parameter_of_255_is_doubled() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_sb_byte(var out, 255), true)
+    test.assert_eq(telnetwire.put_sb_byte(var out, 0x1FF), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFF, 0xFF, 0xFF])
+
+@test
+fn test_a_16_bit_parameter_is_high_byte_first_and_each_byte_is_checked() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_sb_u16(var out, 0x0150), true)
+    test.assert_eq(telnetwire.put_sb_u16(var out, 0xFFFF), true)
+    test.assert_eq(list_of(var out), [0x01, 0x50, 0xFF, 0xFF, 0xFF, 0xFF])
+
+@test
+fn test_a_byte_is_cut_to_eight_bits() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetwire.put_byte(var out, 0x141), true)
+    test.assert_eq(list_of(var out), [0x41])
+
+@test
+fn test_a_full_buffer_takes_nothing_and_every_builder_is_all_or_nothing() [io]
+    var out = filled(telnetwire.TEL_BUF_MAX)
+    test.assert_eq(telnetwire.put_byte(var out, 1), false)
+    test.assert_eq(telnetwire.put_command(var out, 241), false)
+    test.assert_eq(telnetwire.put_negotiate(var out, 251, 1), false)
+    test.assert_eq(telnetwire.put_sb_begin(var out, 24), false)
+    test.assert_eq(telnetwire.put_sb_byte(var out, 255), false)
+    test.assert_eq(telnetwire.put_sb_u16(var out, 0), false)
+    test.assert_eq(telnetwire.put_sb_end(var out), false)
+    test.assert_eq(out.len(), telnetwire.TEL_BUF_MAX)
+
+@test
+fn test_a_sequence_that_half_fits_leaves_the_buffer_as_it_was() [io]
+    // One byte free: the doubled 255 needs two, and the two-byte command needs
+    // two; the three-byte ones need three.
+    var a = filled(telnetwire.TEL_BUF_MAX - 1)
+    test.assert_eq(telnetwire.put_sb_byte(var a, 255), false)
+    test.assert_eq(a.len(), telnetwire.TEL_BUF_MAX - 1)
+    var b = filled(telnetwire.TEL_BUF_MAX - 1)
+    test.assert_eq(telnetwire.put_command(var b, 241), false)
+    test.assert_eq(b.len(), telnetwire.TEL_BUF_MAX - 1)
+    var c = filled(telnetwire.TEL_BUF_MAX - 2)
+    test.assert_eq(telnetwire.put_negotiate(var c, 251, 1), false)
+    test.assert_eq(c.len(), telnetwire.TEL_BUF_MAX - 2)
+    var d = filled(telnetwire.TEL_BUF_MAX - 2)
+    test.assert_eq(telnetwire.put_sb_begin(var d, 24), false)
+    test.assert_eq(d.len(), telnetwire.TEL_BUF_MAX - 2)
+    var e = filled(telnetwire.TEL_BUF_MAX - 1)
+    test.assert_eq(telnetwire.put_sb_end(var e), false)
+    test.assert_eq(e.len(), telnetwire.TEL_BUF_MAX - 1)
+    var f = filled(telnetwire.TEL_BUF_MAX - 1)
+    test.assert_eq(telnetwire.put_sb_u16(var f, 0x00FF), false)
+    test.assert_eq(f.len(), telnetwire.TEL_BUF_MAX - 1)
+
+@test
+fn test_the_last_byte_that_fits_is_written() [io]
+    var a = filled(telnetwire.TEL_BUF_MAX - 2)
+    test.assert_eq(telnetwire.put_command(var a, 241), true)
+    test.assert_eq(a.len(), telnetwire.TEL_BUF_MAX)
+    var b = filled(telnetwire.TEL_BUF_MAX - 3)
+    test.assert_eq(telnetwire.put_negotiate(var b, 251, 1), true)
+    var c = filled(telnetwire.TEL_BUF_MAX - 3)
+    test.assert_eq(telnetwire.put_sb_begin(var c, 24), true)
+
+@test
+fn test_rollback_takes_the_bytes_after_the_mark_off() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    let _ = telnetwire.put_command(var out, telnetwire.TEL_NOP)
+    let mark = out.len()
+    let _ = telnetwire.put_negotiate(var out, telnetwire.TEL_DO, 1)
+    telnetwire.rollback(var out, mark)
+    test.assert_eq(list_of(var out), [0xFF, 0xF1])
+    telnetwire.rollback(var out, mark)
+    test.assert_eq(out.len(), 2)

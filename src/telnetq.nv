@@ -1,0 +1,197 @@
+// telnetq.nv — the Q method of RFC 1143, the rules that keep two Telnet
+// ends from negotiating an option forever, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  RFC 854 and RFC 855
+// say what a WILL, WONT, DO and DONT mean, and say very little about what to
+// do when both ends send them at once.  The classic failure is a loop: one
+// end answers an acknowledgement as though it were a request, and the other
+// answers that, and the line is busy with `IAC DO ECHO` and `IAC WILL ECHO`
+// for as long as the connection lasts.  RFC 1143 gives each side of each
+// option a state, and a rule for every state and every event, that cannot
+// loop.  This module is the rules and nothing else.
+//
+// A STATE belongs to one side of one option: "us" is the end that performs
+// the option (answering DO and DONT with WILL and WONT), "him" is the other
+// (answering WILL and WONT with DO and DONT).  The six states are
+//
+//   NO           the option is off
+//   YES          the option is on
+//   WANTNO       off was asked for and the answer is awaited
+//   WANTNO_OPP   the same, and on is wanted again once it comes (the "opposite
+//                queued" state of the RFC)
+//   WANTYES      on was asked for and the answer is awaited
+//   WANTYES_OPP  the same, and off is wanted again once it comes
+//
+// and the four functions below are the four things that can happen to a side:
+// the peer asks it to turn on (`q_peer_on`) or off (`q_peer_off`), and this
+// end asks it to turn on (`q_ask_on`) or off (`q_ask_off`).  Each answers a
+// number that holds the new state and the reply to send, and
+// `q_state` and `q_reply` take the two apart.  The reply is `Q_REPLY_NONE`,
+// `Q_REPLY_ON` (WILL for "us", DO for "him") or `Q_REPLY_OFF` (WONT or
+// DONT).
+//
+// What makes the loop impossible is that an acknowledgement is never
+// answered: a WILL that arrives in the state WANTYES is the answer to this
+// end's DO, and no reply goes out; a WILL that arrives in the state YES is a
+// repeat and is dropped.  The tests run two ends against each other with
+// random requests and require every exchange to end.
+//
+// The option is in force in YES and while it is being turned off (the two
+// WANTNO states), until the peer confirms; `q_on` says so.
+
+// The option is off.
+pub const Q_NO = 0
+// The option is on.
+pub const Q_YES = 1
+// Off was asked for and the answer is awaited.
+pub const Q_WANTNO = 2
+// Off was asked for, and on is wanted after it.
+pub const Q_WANTNO_OPP = 3
+// On was asked for and the answer is awaited.
+pub const Q_WANTYES = 4
+// On was asked for, and off is wanted after it.
+pub const Q_WANTYES_OPP = 5
+
+// No reply is sent.
+pub const Q_REPLY_NONE = 0
+// The reply is WILL (for "us") or DO (for "him").
+pub const Q_REPLY_ON = 1
+// The reply is WONT (for "us") or DONT (for "him").
+pub const Q_REPLY_OFF = 2
+
+// The number that holds a state and a reply.
+@tier(embedded)
+@no_alloc
+fn res(state: Int, reply: Int) -> Int []
+    state * 4 + reply
+
+// The state in a result.
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     let r = telnetq.q_peer_on(telnetq.Q_NO, true)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 1 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_state(r: Int) -> Int []
+    r >> 2
+
+// The reply in a result.
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     let r = telnetq.q_peer_on(telnetq.Q_NO, false)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 0 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_reply(r: Int) -> Int []
+    r & 3
+
+// Whether an option in `state` is in force: on, or on until the peer
+// confirms that it is off.
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     println("${telnetq.q_on(telnetq.Q_WANTNO)} ${telnetq.q_on(telnetq.Q_WANTYES)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_on(state: Int) -> Bool []
+    state == Q_YES or state == Q_WANTNO or state == Q_WANTNO_OPP
+
+// The peer asked this side to turn on (a DO for "us", a WILL for "him").
+// `agree` says whether this end is willing.
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     // DO ECHO while off, and willing: agree.
+//     let r = telnetq.q_peer_on(telnetq.Q_NO, true)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 1 1
+//     // The same DO again: no reply, so no loop.
+//     let again = telnetq.q_peer_on(telnetq.q_state(r), true)
+//     println("${telnetq.q_state(again)} ${telnetq.q_reply(again)}")   // 1 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_peer_on(state: Int, agree: Bool) -> Int []
+    if state == Q_NO
+        if agree
+            return res(Q_YES, Q_REPLY_ON)
+        return res(Q_NO, Q_REPLY_OFF)
+    if state == Q_WANTNO
+        return res(Q_NO, Q_REPLY_NONE)
+    if state == Q_WANTNO_OPP
+        return res(Q_YES, Q_REPLY_NONE)
+    if state == Q_WANTYES
+        return res(Q_YES, Q_REPLY_NONE)
+    if state == Q_WANTYES_OPP
+        return res(Q_WANTNO, Q_REPLY_OFF)
+    res(Q_YES, Q_REPLY_NONE)
+
+// The peer told this side to turn off (a DONT for "us", a WONT for "him").
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     let r = telnetq.q_peer_off(telnetq.Q_YES)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 0 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_peer_off(state: Int) -> Int []
+    if state == Q_YES
+        return res(Q_NO, Q_REPLY_OFF)
+    if state == Q_WANTNO_OPP
+        return res(Q_WANTYES, Q_REPLY_ON)
+    res(Q_NO, Q_REPLY_NONE)
+
+// This end wants the option on (it sends DO for "him", WILL for "us").
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     let r = telnetq.q_ask_on(telnetq.Q_NO)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 4 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_ask_on(state: Int) -> Int []
+    if state == Q_NO
+        return res(Q_WANTYES, Q_REPLY_ON)
+    if state == Q_WANTNO or state == Q_WANTNO_OPP
+        return res(Q_WANTNO_OPP, Q_REPLY_NONE)
+    if state == Q_WANTYES_OPP
+        return res(Q_WANTYES, Q_REPLY_NONE)
+    res(state, Q_REPLY_NONE)
+
+// This end wants the option off (it sends DONT for "him", WONT for "us").
+//
+// ```novo
+// use telnetq
+//
+// fn main() [io]
+//     let r = telnetq.q_ask_off(telnetq.Q_YES)
+//     println("${telnetq.q_state(r)} ${telnetq.q_reply(r)}")   // 2 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn q_ask_off(state: Int) -> Int []
+    if state == Q_YES
+        return res(Q_WANTNO, Q_REPLY_OFF)
+    if state == Q_WANTNO_OPP
+        return res(Q_WANTNO, Q_REPLY_NONE)
+    if state == Q_WANTYES
+        return res(Q_WANTYES_OPP, Q_REPLY_NONE)
+    res(state, Q_REPLY_NONE)

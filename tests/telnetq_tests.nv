@@ -1,0 +1,270 @@
+// telnetq_tests.nv — the Q method of RFC 1143, state by state.
+//
+// RFC 1143 gives, for each of six states and each of four events, the new
+// state and what to send.  The tables here are copied from the RFC's
+// section 7, written as [new state, reply] with the states in the order
+// NO, YES, WANTNO, WANTNO-OPPOSITE, WANTYES, WANTYES-OPPOSITE and the replies
+// 0 none, 1 affirm (WILL or DO) and 2 refuse (WONT or DONT).
+//
+//   peer asks, we agree      NO -> YES, affirm        YES -> YES
+//                            WANTNO -> NO             WANTNO-OPP -> YES
+//                            WANTYES -> YES           WANTYES-OPP -> WANTNO, refuse
+//   peer asks, we refuse     as above except NO -> NO, refuse
+//   peer tells us to stop    NO -> NO                 YES -> NO, refuse
+//                            WANTNO -> NO             WANTNO-OPP -> WANTYES, affirm
+//                            WANTYES -> NO            WANTYES-OPP -> NO
+//   we ask to turn on        NO -> WANTYES, affirm    YES -> YES
+//                            WANTNO -> WANTNO-OPP     WANTNO-OPP -> WANTNO-OPP
+//                            WANTYES -> WANTYES       WANTYES-OPP -> WANTYES
+//   we ask to turn off       NO -> NO                 YES -> WANTNO, refuse
+//                            WANTNO -> WANTNO         WANTNO-OPP -> WANTNO
+//                            WANTYES -> WANTYES-OPP   WANTYES-OPP -> WANTYES-OPP
+//
+// The last section connects two ends that each run these rules and gives them
+// random requests, to show what the RFC claims: the exchange ends, and ends
+// in agreement.
+
+use std.list
+use std.test
+use telnetq
+
+// A table cell: the state and the reply.
+fn cell(state: Int, reply: Int) -> [Int]
+    [state, reply]
+
+// The result of a call as [state, reply].
+fn pair(r: Int) -> [Int]
+    [telnetq.q_state(r), telnetq.q_reply(r)]
+
+@test
+fn test_the_values() [io]
+    test.assert_eq(telnetq.Q_NO, 0)
+    test.assert_eq(telnetq.Q_YES, 1)
+    test.assert_eq(telnetq.Q_WANTNO, 2)
+    test.assert_eq(telnetq.Q_WANTNO_OPP, 3)
+    test.assert_eq(telnetq.Q_WANTYES, 4)
+    test.assert_eq(telnetq.Q_WANTYES_OPP, 5)
+    test.assert_eq(telnetq.Q_REPLY_NONE, 0)
+    test.assert_eq(telnetq.Q_REPLY_ON, 1)
+    test.assert_eq(telnetq.Q_REPLY_OFF, 2)
+
+@test
+fn test_peer_asks_and_we_agree() [io]
+    let want = [cell(1, 1), cell(1, 0), cell(0, 0), cell(1, 0), cell(1, 0), cell(2, 2)]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(pair(telnetq.q_peer_on(s, true)), want[s])
+
+@test
+fn test_peer_asks_and_we_refuse() [io]
+    let want = [cell(0, 2), cell(1, 0), cell(0, 0), cell(1, 0), cell(1, 0), cell(2, 2)]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(pair(telnetq.q_peer_on(s, false)), want[s])
+
+@test
+fn test_peer_tells_us_to_stop() [io]
+    let want = [cell(0, 0), cell(0, 2), cell(0, 0), cell(4, 1), cell(0, 0), cell(0, 0)]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(pair(telnetq.q_peer_off(s)), want[s])
+
+@test
+fn test_we_ask_to_turn_on() [io]
+    let want = [cell(4, 1), cell(1, 0), cell(3, 0), cell(3, 0), cell(4, 0), cell(4, 0)]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(pair(telnetq.q_ask_on(s)), want[s])
+
+@test
+fn test_we_ask_to_turn_off() [io]
+    let want = [cell(0, 0), cell(2, 2), cell(2, 0), cell(2, 0), cell(5, 0), cell(5, 0)]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(pair(telnetq.q_ask_off(s)), want[s])
+
+@test
+fn test_an_option_is_on_in_yes_and_while_it_is_being_turned_off() [io]
+    let want = [false, true, true, true, false, false]
+    for s in 0..6
+        test.case("state ${s}")
+        test.assert_eq(telnetq.q_on(s), want[s])
+
+@test
+fn test_a_state_outside_the_six_is_treated_as_a_request_already_met() [io]
+    // Nothing in the API makes one, but a corrupted value must not send.
+    test.assert_eq(telnetq.q_reply(telnetq.q_peer_on(9, false)), 0)
+    test.assert_eq(telnetq.q_reply(telnetq.q_ask_on(9)), 0)
+    test.assert_eq(telnetq.q_reply(telnetq.q_ask_off(9)), 0)
+    test.assert_eq(telnetq.q_state(telnetq.q_peer_off(9)), 0)
+
+// ── Two ends against each other ────────────────────────────────────
+
+// The next number of a small generator.
+fn next(s: Int) -> Int
+    (s * 1103515245 + 12345) & 0x7FFFFFFF
+
+// One end of one option: its two states and whether it agrees to perform the
+// option and to let the other perform it.
+struct End
+    var us: Int
+    var him: Int
+    var do_it: Bool
+    var let_him: Bool
+
+// Verbs in flight: 0 WILL, 1 WONT, 2 DO, 3 DONT.
+// Send what a reply says for a side: "us" speaks WILL and WONT, "him" speaks
+// DO and DONT.
+fn send(var wire: [Int], side_us: Bool, reply: Int)
+    if reply == 1
+        if side_us
+            list.push(wire, 0)
+        else
+            list.push(wire, 2)
+    elif reply == 2
+        if side_us
+            list.push(wire, 1)
+        else
+            list.push(wire, 3)
+
+// An end takes a message.
+fn deliver(var e: End, verb: Int, var back: [Int])
+    if verb == 0
+        let r = telnetq.q_peer_on(e.him, e.let_him)
+        e.him = telnetq.q_state(r)
+        send(var back, false, telnetq.q_reply(r))
+    elif verb == 1
+        let r = telnetq.q_peer_off(e.him)
+        e.him = telnetq.q_state(r)
+        send(var back, false, telnetq.q_reply(r))
+    elif verb == 2
+        let r = telnetq.q_peer_on(e.us, e.do_it)
+        e.us = telnetq.q_state(r)
+        send(var back, true, telnetq.q_reply(r))
+    else
+        let r = telnetq.q_peer_off(e.us)
+        e.us = telnetq.q_state(r)
+        send(var back, true, telnetq.q_reply(r))
+
+@test
+fn test_two_ends_with_random_requests_always_come_to_rest_in_agreement() [io]
+    var seed = 5
+    for round in 0..400
+        seed = next(seed)
+        var a = End { us: 0, him: 0, do_it: (seed & 1) == 1, let_him: (seed & 2) == 2 }
+        var b = End { us: 0, him: 0, do_it: (seed & 4) == 4, let_him: (seed & 8) == 8 }
+        // to_a holds what is on its way to A, to_b what is on its way to B.
+        var to_a: [Int] = []
+        var to_b: [Int] = []
+        var sent = 0
+        // Up to six requests from either end, spread through the exchange.
+        for step in 0..6
+            seed = next(seed)
+            let k = (seed >> 6) % 8
+            var r = 0
+            if k == 0
+                r = telnetq.q_ask_on(a.us)
+                a.us = telnetq.q_state(r)
+                send(var to_b, true, telnetq.q_reply(r))
+            elif k == 1
+                r = telnetq.q_ask_off(a.us)
+                a.us = telnetq.q_state(r)
+                send(var to_b, true, telnetq.q_reply(r))
+            elif k == 2
+                r = telnetq.q_ask_on(a.him)
+                a.him = telnetq.q_state(r)
+                send(var to_b, false, telnetq.q_reply(r))
+            elif k == 3
+                r = telnetq.q_ask_off(a.him)
+                a.him = telnetq.q_state(r)
+                send(var to_b, false, telnetq.q_reply(r))
+            elif k == 4
+                r = telnetq.q_ask_on(b.us)
+                b.us = telnetq.q_state(r)
+                send(var to_a, true, telnetq.q_reply(r))
+            elif k == 5
+                r = telnetq.q_ask_off(b.us)
+                b.us = telnetq.q_state(r)
+                send(var to_a, true, telnetq.q_reply(r))
+            elif k == 6
+                r = telnetq.q_ask_on(b.him)
+                b.him = telnetq.q_state(r)
+                send(var to_a, false, telnetq.q_reply(r))
+            else
+                r = telnetq.q_ask_off(b.him)
+                b.him = telnetq.q_state(r)
+                send(var to_a, false, telnetq.q_reply(r))
+            // Deliver one message, from whichever end has one.
+            if list.len(to_b) > 0 and (seed & 1) == 0
+                let verb = to_b[0]
+                to_b = list.slice(to_b, 1, list.len(to_b))
+                deliver(var b, verb, var to_a)
+                sent = sent + 1
+            elif list.len(to_a) > 0
+                let verb = to_a[0]
+                to_a = list.slice(to_a, 1, list.len(to_a))
+                deliver(var a, verb, var to_b)
+                sent = sent + 1
+        // Now deliver everything until the wires are empty.  A loop would not
+        // empty them.
+        for _i in 0..200
+            if list.len(to_b) > 0
+                let verb = to_b[0]
+                to_b = list.slice(to_b, 1, list.len(to_b))
+                deliver(var b, verb, var to_a)
+                sent = sent + 1
+            if list.len(to_a) > 0
+                let verb = to_a[0]
+                to_a = list.slice(to_a, 1, list.len(to_a))
+                deliver(var a, verb, var to_b)
+                sent = sent + 1
+        test.case("round ${round}")
+        test.assert_eq(list.len(to_a) + list.len(to_b), 0)
+        test.assert_eq(sent < 60, true)
+        // At rest nothing is being asked, and the two views of one side of
+        // an option are the same.
+        test.assert_eq(a.us == 0 or a.us == 1, true)
+        test.assert_eq(a.him == 0 or a.him == 1, true)
+        test.assert_eq(b.us == 0 or b.us == 1, true)
+        test.assert_eq(b.him == 0 or b.him == 1, true)
+        test.assert_eq(a.us, b.him)
+        test.assert_eq(b.us, a.him)
+
+@test
+fn test_the_classic_loop_does_not_happen() [io]
+    // Each end offers ECHO at once: A says WILL ECHO and DO ECHO, B says the
+    // same.  Four messages cross; the answers to them are answers and are not
+    // answered.
+    var a = End { us: 0, him: 0, do_it: true, let_him: true }
+    var b = End { us: 0, him: 0, do_it: true, let_him: true }
+    var to_a: [Int] = []
+    var to_b: [Int] = []
+    var r = telnetq.q_ask_on(a.us)
+    a.us = telnetq.q_state(r)
+    send(var to_b, true, telnetq.q_reply(r))
+    r = telnetq.q_ask_on(a.him)
+    a.him = telnetq.q_state(r)
+    send(var to_b, false, telnetq.q_reply(r))
+    r = telnetq.q_ask_on(b.us)
+    b.us = telnetq.q_state(r)
+    send(var to_a, true, telnetq.q_reply(r))
+    r = telnetq.q_ask_on(b.him)
+    b.him = telnetq.q_state(r)
+    send(var to_a, false, telnetq.q_reply(r))
+    var total = 0
+    for _i in 0..50
+        if list.len(to_b) > 0
+            let verb = to_b[0]
+            to_b = list.slice(to_b, 1, list.len(to_b))
+            deliver(var b, verb, var to_a)
+            total = total + 1
+        if list.len(to_a) > 0
+            let verb = to_a[0]
+            to_a = list.slice(to_a, 1, list.len(to_a))
+            deliver(var a, verb, var to_b)
+            total = total + 1
+    test.assert_eq(total, 4)
+    test.assert_eq(a.us, 1)
+    test.assert_eq(a.him, 1)
+    test.assert_eq(b.us, 1)
+    test.assert_eq(b.him, 1)

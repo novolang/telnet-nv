@@ -1,0 +1,670 @@
+// telnetcom.nv — a serial port over Telnet, RFC 2217 (COM-PORT-CONTROL), with
+// no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A terminal server, or a
+// microcontroller with a UART and a network link, offers its serial port to a
+// program elsewhere.  The bytes of the port are the Telnet data stream, in
+// BINARY mode.  What would be the port's settings and its control lines
+// travel as subnegotiations of option 44: `IAC SB 44 code value IAC SE`.
+//
+// THE COMMANDS.  The client sends a code below 100 and the server answers with
+// the same code plus 100 and the value now in force:
+//
+//   0 SIGNATURE            the server answers with its name
+//   1 SET-BAUDRATE         four bytes, the rate in bits a second
+//   2 SET-DATASIZE         one byte, 5 to 8
+//   3 SET-PARITY           1 none, 2 odd, 3 even, 4 mark, 5 space
+//   4 SET-STOPSIZE         1 one bit, 2 two bits, 3 one and a half
+//   5 SET-CONTROL          flow control, the break state, DTR and RTS: values
+//                          1 to 3 set the output flow control (none,
+//                          XON/XOFF, hardware), 4 asks for the break state,
+//                          5 and 6 set and clear it, 7 asks for DTR, 8 and 9
+//                          set and clear it, 10 asks for RTS, 11 and 12 set
+//                          and clear it, 13 asks for the input flow control,
+//                          14 to 16 set it (none, XON/XOFF, hardware)
+//   6 NOTIFY-LINESTATE     server to client: a byte of line-state bits
+//   7 NOTIFY-MODEMSTATE    server to client: a byte of modem-state bits
+//   8 FLOWCONTROL-SUSPEND  client to server: stop sending data
+//   9 FLOWCONTROL-RESUME   client to server: go on
+//   10 SET-LINESTATE-MASK  which line-state bits are worth a notification
+//   11 SET-MODEMSTATE-MASK the same for the modem-state bits
+//   12 PURGE-DATA          1 the receive buffer, 2 the transmit buffer, 3 both
+//
+// A value of 0 in a request for the baud rate, data size, parity or stop size
+// asks for the value now in force and changes nothing.
+//
+// The line-state byte has bit 0 data ready, 1 overrun error, 2 parity error,
+// 3 framing error, 4 transmit holding register empty, 5 transmit shift
+// register empty, 6 timeout error.  The modem-state byte has bit 0 the change
+// of CTS, 1 of DSR, 2 the trailing edge of RI, 3 the change of DCD, and
+// bits 4 to 7 the levels of CTS, DSR, RI and DCD.
+//
+// ONE STATE FOR BOTH ENDS.  `ComPort` holds the port's settings.  A server
+// holds the real ones: `com_handle` applies a request to it, builds the
+// answer, and says in a mask of `COM_CHG_` bits what changed, so that the
+// caller can set the UART.  A client holds a mirror: `com_handle` takes the
+// server's answers and notifications into it.  The builders `com_set_baud`
+// and the others write the client's requests.  Reading a request that is
+// short, or a code the package does not know, changes nothing and answers
+// nothing.
+
+use std.str
+use telnetwire
+
+// SIGNATURE, 0.
+pub const COM_SIGNATURE = 0
+// SET-BAUDRATE, 1.
+pub const COM_SET_BAUDRATE = 1
+// SET-DATASIZE, 2.
+pub const COM_SET_DATASIZE = 2
+// SET-PARITY, 3.
+pub const COM_SET_PARITY = 3
+// SET-STOPSIZE, 4.
+pub const COM_SET_STOPSIZE = 4
+// SET-CONTROL, 5.
+pub const COM_SET_CONTROL = 5
+// NOTIFY-LINESTATE, 6.
+pub const COM_NOTIFY_LINESTATE = 6
+// NOTIFY-MODEMSTATE, 7.
+pub const COM_NOTIFY_MODEMSTATE = 7
+// FLOWCONTROL-SUSPEND, 8.
+pub const COM_FLOW_SUSPEND = 8
+// FLOWCONTROL-RESUME, 9.
+pub const COM_FLOW_RESUME = 9
+// SET-LINESTATE-MASK, 10.
+pub const COM_SET_LINESTATE_MASK = 10
+// SET-MODEMSTATE-MASK, 11.
+pub const COM_SET_MODEMSTATE_MASK = 11
+// PURGE-DATA, 12.
+pub const COM_PURGE_DATA = 12
+// What is added to a code to make the server's answer: 100.
+pub const COM_REPLY = 100
+
+// Parity: none.
+pub const COM_PARITY_NONE = 1
+// Parity: odd.
+pub const COM_PARITY_ODD = 2
+// Parity: even.
+pub const COM_PARITY_EVEN = 3
+// Parity: mark.
+pub const COM_PARITY_MARK = 4
+// Parity: space.
+pub const COM_PARITY_SPACE = 5
+
+// `com_handle`: the baud rate changed.
+pub const COM_CHG_BAUD = 1
+// `com_handle`: the data size changed.
+pub const COM_CHG_DATASIZE = 2
+// `com_handle`: the parity changed.
+pub const COM_CHG_PARITY = 4
+// `com_handle`: the stop size changed.
+pub const COM_CHG_STOPSIZE = 8
+// `com_handle`: the output flow control changed.
+pub const COM_CHG_FLOW = 16
+// `com_handle`: the break state changed.
+pub const COM_CHG_BREAK = 32
+// `com_handle`: DTR changed.
+pub const COM_CHG_DTR = 64
+// `com_handle`: RTS changed.
+pub const COM_CHG_RTS = 128
+// `com_handle`: a purge was asked for; `cp.purge` says which buffers.
+pub const COM_CHG_PURGE = 256
+// `com_handle`: the peer suspended or resumed the data flow.
+pub const COM_CHG_SUSPEND = 512
+// `com_handle`: a notification arrived, or a mask changed.
+pub const COM_CHG_STATE = 1024
+// `com_handle`: the input flow control changed.
+pub const COM_CHG_INFLOW = 2048
+
+// The settings of a serial port, and the last states reported.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct ComPort
+    // The rate in bits a second.
+    baud: Int
+    // The data bits, 5 to 8.
+    datasize: Int
+    // One of the `COM_PARITY_` values.
+    parity: Int
+    // 1, 2 or 3 (one and a half).
+    stopsize: Int
+    // The output flow control: 1 none, 2 XON/XOFF, 3 hardware.
+    flow: Int
+    // The input flow control: 14 none, 15 XON/XOFF, 16 hardware.
+    inflow: Int
+    // Whether a break is being sent.
+    brk: Bool
+    // Whether DTR is set.
+    dtr: Bool
+    // Whether RTS is set.
+    rts: Bool
+    // The last line state.
+    linestate: Int
+    // The last modem state.
+    modemstate: Int
+    // The line-state bits that are notified.
+    ls_mask: Int
+    // The modem-state bits that are notified.
+    ms_mask: Int
+    // Whether the data flow is suspended.
+    suspended: Bool
+    // The buffers the last purge named: 1, 2 or 3.
+    purge: Int
+
+// A port at the RFC's defaults: 9600 bits a second, 8 data bits, no parity,
+// one stop bit, no flow control, DTR and RTS set, every modem-state bit
+// notified and no line-state bit.
+//
+// ```novo
+// use telnetcom
+//
+// fn main() [io]
+//     let p = telnetcom.com_new()
+//     println("${p.baud} ${p.datasize} ${p.parity} ${p.stopsize} ${p.ms_mask}")   // 9600 8 1 1 255
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_new() -> ComPort []
+    ComPort { baud: 9600, datasize: 8, parity: COM_PARITY_NONE, stopsize: 1, flow: 1, inflow: 14,
+              brk: false, dtr: true, rts: true, linestate: 0, modemstate: 0, ls_mask: 0,
+              ms_mask: 255, suspended: false, purge: 0 }
+
+// Begin a COM-PORT subnegotiation with `code`, and append `width` bytes of
+// `value`, high byte first.
+@tier(embedded)
+@no_alloc
+fn com_message(var out: TelBuf, code: Int, width: Int, value: Int) -> Bool []
+    let mark = out.len()
+    var ok = telnetwire.put_sb_begin(var out, TELOPT_COM_PORT) and telnetwire.put_sb_byte(var out, code)
+    for i in 0..width
+        ok = ok and telnetwire.put_sb_byte(var out, (value >> (8 * (width - 1 - i))) & 0xFF)
+    ok = ok and telnetwire.put_sb_end(var out)
+    if not ok
+        telnetwire.rollback(var out, mark)
+    ok
+
+// Append SET-BAUDRATE: ask the server for `baud` bits a second (0 asks for the
+// rate in force).
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_baud(var out, 115200)
+//     println("${ok} ${out.len()} ${out[3]} ${out[5]} ${out[6]}")   // true 10 1 1 194
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_baud(var out: TelBuf, baud: Int) -> Bool []
+    com_message(var out, COM_SET_BAUDRATE, 4, baud)
+
+// Append SET-DATASIZE.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_datasize(var out, 7)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 2 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_datasize(var out: TelBuf, bits: Int) -> Bool []
+    com_message(var out, COM_SET_DATASIZE, 1, bits)
+
+// Append SET-PARITY.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_parity(var out, telnetcom.COM_PARITY_EVEN)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 3 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_parity(var out: TelBuf, parity: Int) -> Bool []
+    com_message(var out, COM_SET_PARITY, 1, parity)
+
+// Append SET-STOPSIZE.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_stopsize(var out, 2)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 4 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_stopsize(var out: TelBuf, stop: Int) -> Bool []
+    com_message(var out, COM_SET_STOPSIZE, 1, stop)
+
+// Append SET-CONTROL with the value `control` (1 to 19, see the list above).
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_control(var out, 8)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 5 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_control(var out: TelBuf, control: Int) -> Bool []
+    com_message(var out, COM_SET_CONTROL, 1, control)
+
+// Append SET-LINESTATE-MASK.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_linestate_mask(var out, 0x0F)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 10 15
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_linestate_mask(var out: TelBuf, mask: Int) -> Bool []
+    com_message(var out, COM_SET_LINESTATE_MASK, 1, mask)
+
+// Append SET-MODEMSTATE-MASK.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_set_modemstate_mask(var out, 0xF0)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 11 240
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_set_modemstate_mask(var out: TelBuf, mask: Int) -> Bool []
+    com_message(var out, COM_SET_MODEMSTATE_MASK, 1, mask)
+
+// Append PURGE-DATA: 1 the receive buffer, 2 the transmit buffer, 3 both.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_purge(var out, 3)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 12 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_purge(var out: TelBuf, which: Int) -> Bool []
+    com_message(var out, COM_PURGE_DATA, 1, which)
+
+// Append FLOWCONTROL-SUSPEND (`on` true) or FLOWCONTROL-RESUME: tells the
+// server to stop or go on sending data.  The command carries no value.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_suspend(var out, true)
+//     println("${ok} ${out[3]}")   // true 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_suspend(var out: TelBuf, on: Bool) -> Bool []
+    if on
+        return com_message(var out, COM_FLOW_SUSPEND, 0, 0)
+    com_message(var out, COM_FLOW_RESUME, 0, 0)
+
+// Append SIGNATURE with no name: asks the server for its name.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_ask_signature(var out)
+//     println("${ok} ${out.len()} ${out[3]}")   // true 6 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_ask_signature(var out: TelBuf) -> Bool []
+    com_message(var out, COM_SIGNATURE, 0, 0)
+
+// The big-endian number in `width` bytes of the subnegotiation from byte 1, or
+// -1 when it holds fewer.
+@tier(embedded)
+@no_alloc
+fn value_of(var sub: TelSb, width: Int) -> Int []
+    if sub.len() < 1 + width
+        return -1
+    var v = 0
+    for i in 0..width
+        v = (v << 8) | sub[1 + i] as Int
+    v
+
+// Answer a request with code `code + 100` and the value now in force.
+@tier(embedded)
+@no_alloc
+fn answer(var out: TelBuf, code: Int, width: Int, value: Int) []
+    let _ = com_message(var out, code + COM_REPLY, width, value)
+
+// The SET-CONTROL value that says the state of a line: `on_value` when it is
+// on, `off_value` when it is off.
+@tier(embedded)
+@no_alloc
+fn line_value(on: Bool, on_value: Int, off_value: Int) -> Int []
+    if on
+        return on_value
+    off_value
+
+// Apply a SET-CONTROL request to the port and answer the value now in force.
+// `changed` is a mask of `COM_CHG_` bits that it adds to.
+@tier(embedded)
+@no_alloc
+fn apply_control(var cp: ComPort, v: Int) -> Int []
+    if v >= 1 and v <= 3
+        cp.flow = v
+    elif v == 5
+        cp.brk = true
+    elif v == 6
+        cp.brk = false
+    elif v == 8
+        cp.dtr = true
+    elif v == 9
+        cp.dtr = false
+    elif v == 11
+        cp.rts = true
+    elif v == 12
+        cp.rts = false
+    elif v >= 14 and v <= 16
+        cp.inflow = v
+    if v == 4 or v == 5 or v == 6
+        return line_value(cp.brk, 5, 6)
+    if v == 7 or v == 8 or v == 9
+        return line_value(cp.dtr, 8, 9)
+    if v == 10 or v == 11 or v == 12
+        return line_value(cp.rts, 11, 12)
+    if v == 13 or v >= 14 and v <= 16
+        return cp.inflow
+    cp.flow
+
+// The change bit that a SET-CONTROL value makes.
+@tier(embedded)
+@no_alloc
+fn control_bit(v: Int) -> Int []
+    if v >= 1 and v <= 3
+        return COM_CHG_FLOW
+    if v == 5 or v == 6
+        return COM_CHG_BREAK
+    if v == 8 or v == 9
+        return COM_CHG_DTR
+    if v == 11 or v == 12
+        return COM_CHG_RTS
+    if v >= 14 and v <= 16
+        return COM_CHG_INFLOW
+    0
+
+// Handle a request from the client, as a server: change the port, append the
+// answer to `out`, and say what changed.
+@tier(embedded)
+@no_alloc
+fn handle_request(var cp: ComPort, var sub: TelSb, var out: TelBuf) -> Int []
+    let code = sub[0] as Int
+    if code == COM_SIGNATURE
+        let mark = out.len()
+        var ok = telnetwire.put_sb_begin(var out, TELOPT_COM_PORT)
+        ok = ok and telnetwire.put_sb_byte(var out, COM_SIGNATURE + COM_REPLY)
+        let name = "telnet-nv"
+        for i in 0..str.len(name)
+            ok = ok and telnetwire.put_sb_byte(var out, str.byte_at_or(name, i, 0))
+        ok = ok and telnetwire.put_sb_end(var out)
+        if not ok
+            telnetwire.rollback(var out, mark)
+        return 0
+    if code == COM_SET_BAUDRATE
+        let v = value_of(var sub, 4)
+        if v < 0
+            return 0
+        var chg = 0
+        if v > 0 and v != cp.baud
+            cp.baud = v
+            chg = COM_CHG_BAUD
+        answer(var out, code, 4, cp.baud)
+        return chg
+    if code == COM_SET_DATASIZE
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        var chg = 0
+        if v >= 5 and v <= 8 and v != cp.datasize
+            cp.datasize = v
+            chg = COM_CHG_DATASIZE
+        answer(var out, code, 1, cp.datasize)
+        return chg
+    if code == COM_SET_PARITY
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        var chg = 0
+        if v >= 1 and v <= 5 and v != cp.parity
+            cp.parity = v
+            chg = COM_CHG_PARITY
+        answer(var out, code, 1, cp.parity)
+        return chg
+    if code == COM_SET_STOPSIZE
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        var chg = 0
+        if v >= 1 and v <= 3 and v != cp.stopsize
+            cp.stopsize = v
+            chg = COM_CHG_STOPSIZE
+        answer(var out, code, 1, cp.stopsize)
+        return chg
+    if code == COM_SET_CONTROL
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        let now = apply_control(var cp, v)
+        answer(var out, code, 1, now)
+        return control_bit(v)
+    if code == COM_SET_LINESTATE_MASK
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        cp.ls_mask = v
+        answer(var out, code, 1, v)
+        return COM_CHG_STATE
+    if code == COM_SET_MODEMSTATE_MASK
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        cp.ms_mask = v
+        answer(var out, code, 1, v)
+        return COM_CHG_STATE
+    if code == COM_PURGE_DATA
+        let v = value_of(var sub, 1)
+        if v < 1 or v > 3
+            return 0
+        cp.purge = v
+        answer(var out, code, 1, v)
+        return COM_CHG_PURGE
+    if code == COM_FLOW_SUSPEND
+        cp.suspended = true
+        return COM_CHG_SUSPEND
+    if code == COM_FLOW_RESUME
+        cp.suspended = false
+        return COM_CHG_SUSPEND
+    0
+
+// Take a SET-CONTROL answer into the mirror.
+@tier(embedded)
+@no_alloc
+fn take_control(var cp: ComPort, v: Int) -> Int []
+    if v >= 1 and v <= 3
+        cp.flow = v
+        return COM_CHG_FLOW
+    if v == 5 or v == 6
+        cp.brk = v == 5
+        return COM_CHG_BREAK
+    if v == 8 or v == 9
+        cp.dtr = v == 8
+        return COM_CHG_DTR
+    if v == 11 or v == 12
+        cp.rts = v == 11
+        return COM_CHG_RTS
+    if v >= 14 and v <= 16
+        cp.inflow = v
+        return COM_CHG_INFLOW
+    0
+
+// Handle an answer or a notification from the server, as a client: take it
+// into the mirror and say what changed.
+@tier(embedded)
+@no_alloc
+fn handle_reply(var cp: ComPort, var sub: TelSb) -> Int []
+    let code = sub[0] as Int - COM_REPLY
+    if code == COM_SET_BAUDRATE
+        let v = value_of(var sub, 4)
+        if v > 0 and v != cp.baud
+            cp.baud = v
+            return COM_CHG_BAUD
+        return 0
+    if code == COM_SET_DATASIZE
+        let v = value_of(var sub, 1)
+        if v >= 5 and v <= 8 and v != cp.datasize
+            cp.datasize = v
+            return COM_CHG_DATASIZE
+        return 0
+    if code == COM_SET_PARITY
+        let v = value_of(var sub, 1)
+        if v >= 1 and v <= 5 and v != cp.parity
+            cp.parity = v
+            return COM_CHG_PARITY
+        return 0
+    if code == COM_SET_STOPSIZE
+        let v = value_of(var sub, 1)
+        if v >= 1 and v <= 3 and v != cp.stopsize
+            cp.stopsize = v
+            return COM_CHG_STOPSIZE
+        return 0
+    if code == COM_SET_CONTROL
+        return take_control(var cp, value_of(var sub, 1))
+    if code == COM_NOTIFY_LINESTATE
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        cp.linestate = v
+        return COM_CHG_STATE
+    if code == COM_NOTIFY_MODEMSTATE
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        cp.modemstate = v
+        return COM_CHG_STATE
+    if code == COM_SET_LINESTATE_MASK or code == COM_SET_MODEMSTATE_MASK
+        let v = value_of(var sub, 1)
+        if v < 0
+            return 0
+        if code == COM_SET_LINESTATE_MASK
+            cp.ls_mask = v
+        else
+            cp.ms_mask = v
+        return COM_CHG_STATE
+    if code == COM_PURGE_DATA
+        let v = value_of(var sub, 1)
+        if v >= 1 and v <= 3
+            cp.purge = v
+            return COM_CHG_PURGE
+        return 0
+    0
+
+// Handle a received COM-PORT subnegotiation (`s.sub`, whose first byte is the
+// code).  A code below 100 is a request, which a server applies to its port
+// and answers into `out`; a code of 100 and over is an answer or a
+// notification, which a client takes into its mirror.  Answers the
+// `COM_CHG_` bits of what changed, or 0 for a subnegotiation that is empty,
+// short or unknown.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var port = telnetcom.com_new()
+//     var sub: telnetwire.TelSb = Vec.new()
+//     for b in [1, 0, 1, 194, 0]
+//         let _ = sub.push(b as u8)
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let chg = telnetcom.com_handle(var port, var sub, var out)
+//     println("${chg} ${port.baud} ${out.len()} ${out[3]}")   // 1 115200 10 101
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_handle(var cp: ComPort, var sub: TelSb, var out: TelBuf) -> Int []
+    if sub.len() < 1
+        return 0
+    if (sub[0] as Int) >= COM_REPLY
+        return handle_reply(var cp, var sub)
+    handle_request(var cp, var sub, var out)
+
+// Tell the client the line state changed to `state`, if any bit of it is in the
+// mask the client set; a server calls this when its UART reports an error or a
+// transmitter going empty.  Answers whether a notification was appended.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var port = telnetcom.com_new()
+//     var out: telnetwire.TelBuf = Vec.new()
+//     println("${telnetcom.com_notify_linestate(var port, 0x08, var out)}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_notify_linestate(var cp: ComPort, state: Int, var out: TelBuf) -> Bool []
+    cp.linestate = state & 0xFF
+    if (state & cp.ls_mask) == 0
+        return false
+    com_message(var out, COM_NOTIFY_LINESTATE + COM_REPLY, 1, state)
+
+// Tell the client the modem state changed to `state`, if any bit of it is in
+// the mask the client set.
+//
+// ```novo
+// use telnetcom
+// use telnetwire
+//
+// fn main() [io]
+//     var port = telnetcom.com_new()
+//     var out: telnetwire.TelBuf = Vec.new()
+//     let ok = telnetcom.com_notify_modemstate(var port, 0x11, var out)
+//     println("${ok} ${out[3]} ${out[4]}")   // true 107 17
+// ```
+pub @tier(embedded)
+@no_alloc
+fn com_notify_modemstate(var cp: ComPort, state: Int, var out: TelBuf) -> Bool []
+    cp.modemstate = state & 0xFF
+    if (state & cp.ms_mask) == 0
+        return false
+    com_message(var out, COM_NOTIFY_MODEMSTATE + COM_REPLY, 1, state)

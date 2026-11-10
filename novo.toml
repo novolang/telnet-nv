@@ -1,0 +1,22 @@
+[package]
+name        = "telnet-nv"
+version     = "0.1.0"
+description = "Telnet for novo-lang over bytes the caller moves: the Network Virtual Terminal and its commands (RFC 854), option negotiation by the Q method so that it cannot loop (RFC 855, RFC 1143), subnegotiation, and the options ECHO, SUPPRESS-GO-AHEAD, BINARY, END-OF-RECORD, NAWS, TERMINAL-TYPE, TERMINAL-SPEED, NEW-ENVIRON and COM-PORT-CONTROL (RFC 2217, a serial port over Telnet), for a client or a server. No sockets and no allocation."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["telnet", "rfc854", "rfc855", "rfc1143", "rfc2217", "com-port", "serial", "terminal", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/telnet-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Telnet and a serial port over Telnet, as steps the caller drives"
+
+[dependencies]
+# None.  A stream is bytes the caller moves, and the state of the negotiation
+# is integers and fixed buffers; nothing here needs another package.

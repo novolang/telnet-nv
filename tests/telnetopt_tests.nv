@@ -1,0 +1,279 @@
+// telnetopt_tests.nv — the option subnegotiations of RFC 1091, 1079, 1073 and
+// 1572, byte for byte.
+//
+// With IAC 255 (FF), SB 250 (FA), SE 240 (F0), the options TERMINAL-TYPE 24
+// (18), TERMINAL-SPEED 32 (20), NAWS 31 (1F) and NEW-ENVIRON 39 (27):
+//
+//     SB 24 SEND                    FF FA 18 01 FF F0
+//     SB 24 IS "VT100"              FF FA 18 00 56 54 31 30 30 FF F0
+//     SB 32 IS "38400,9600"         FF FA 20 00 33 38 34 30 30 2C 39 36 30 30 FF F0
+//     SB 31 for 80 by 24            FF FA 1F 00 50 00 18 FF F0
+//     SB 31 for 255 by 255          FF FA 1F 00 FF FF 00 FF FF FF F0
+//     SB 39 IS VAR "USER" VALUE "kim"
+//                                   FF FA 27 00 00 55 53 45 52 01 6B 69 6D FF F0
+//
+// "VT100" is 56 54 31 30 30; "38400" is 33 38 34 30 30 and "9600" is 39 36 30
+// 30, with the comma 2C between; the width 255 is the byte FF, which is sent
+// doubled.  In NEW-ENVIRON a text byte that is itself VAR (0), VALUE (1), ESC
+// (2) or USERVAR (3) is preceded by ESC (2).
+
+use std.list
+use std.test
+use telnetopt
+use telnetwire
+
+// The bytes of a buffer as a list.
+fn list_of(var out: telnetwire.TelBuf) -> [Int]
+    var xs: [Int] = []
+    for i in 0..out.len()
+        list.push(xs, out[i] as Int)
+    xs
+
+// A received subnegotiation from a list of bytes.
+fn sub_of(xs: [Int]) -> telnetwire.TelSb
+    var sub: telnetwire.TelSb = Vec.new()
+    for x in xs
+        let _ = sub.push(x as u8)
+    sub
+
+// A buffer with only `n` bytes free.
+fn nearly_full(n: Int) -> telnetwire.TelBuf
+    var out: telnetwire.TelBuf = Vec.new()
+    for _i in 0..telnetwire.TEL_BUF_MAX - n
+        let _ = out.push(0x55)
+    out
+
+@test
+fn test_the_subcommands() [io]
+    test.assert_eq(telnetopt.TEL_IS, 0)
+    test.assert_eq(telnetopt.TEL_SEND, 1)
+    test.assert_eq(telnetopt.TEL_INFO, 2)
+    test.assert_eq(telnetopt.TEL_ENV_VAR, 0)
+    test.assert_eq(telnetopt.TEL_ENV_VALUE, 1)
+    test.assert_eq(telnetopt.TEL_ENV_ESC, 2)
+    test.assert_eq(telnetopt.TEL_ENV_USERVAR, 3)
+
+@test
+fn test_terminal_type_send() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.ttype_send(var out), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x18, 0x01, 0xFF, 0xF0])
+
+@test
+fn test_terminal_type_is() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.ttype_is(var out, "VT100"), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x18, 0x00, 0x56, 0x54, 0x31, 0x30, 0x30, 0xFF, 0xF0])
+
+@test
+fn test_terminal_type_is_from_a_buffer_matches_the_text_form() [io]
+    var name: Vec[u8; 40] = Vec.new()
+    for b in [0x56, 0x54, 0x31, 0x30, 0x30]
+        let _ = name.push(b as u8)
+    var a: telnetwire.TelBuf = Vec.new()
+    var b: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.ttype_is_bytes(var a, var name), true)
+    test.assert_eq(telnetopt.ttype_is(var b, "VT100"), true)
+    test.assert_eq(list_of(var a), list_of(var b))
+
+@test
+fn test_a_terminal_name_with_a_byte_of_255_is_doubled() [io]
+    var name: Vec[u8; 40] = Vec.new()
+    let _ = name.push(0xFF)
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.ttype_is_bytes(var out, var name), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x18, 0x00, 0xFF, 0xFF, 0xFF, 0xF0])
+
+@test
+fn test_terminal_speed_send_and_is() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.tspeed_send(var out), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x20, 0x01, 0xFF, 0xF0])
+    var is_: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.tspeed_is(var is_, 38400, 9600), true)
+    test.assert_eq(list_of(var is_),
+                   [0xFF, 0xFA, 0x20, 0x00, 0x33, 0x38, 0x34, 0x30, 0x30, 0x2C, 0x39, 0x36, 0x30, 0x30, 0xFF, 0xF0])
+
+@test
+fn test_terminal_speed_of_zero_and_of_a_negative_is_zero() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.tspeed_is(var out, 0, -5), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x20, 0x00, 0x30, 0x2C, 0x30, 0xFF, 0xF0])
+
+@test
+fn test_naws() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.naws(var out, 80, 24), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0])
+
+@test
+fn test_naws_doubles_a_dimension_of_255() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.naws(var out, 255, 255), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x1F, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xF0])
+
+@test
+fn test_naws_is_cut_to_16_bits() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.naws(var out, 0x10050, 24), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x1F, 0x00, 0x50, 0x00, 0x18, 0xFF, 0xF0])
+
+@test
+fn test_environ_is_with_a_variable_and_a_value() [io]
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.environ_begin(var out, telnetopt.TEL_IS), true)
+    test.assert_eq(telnetopt.environ_item(var out, telnetopt.TEL_ENV_VAR, "USER"), true)
+    test.assert_eq(telnetopt.environ_item(var out, telnetopt.TEL_ENV_VALUE, "kim"), true)
+    test.assert_eq(telnetwire.put_sb_end(var out), true)
+    test.assert_eq(list_of(var out),
+                   [0xFF, 0xFA, 0x27, 0x00, 0x00, 0x55, 0x53, 0x45, 0x52, 0x01, 0x6B, 0x69, 0x6D, 0xFF, 0xF0])
+
+@test
+fn test_environ_escapes_text_that_looks_like_a_kind() [io]
+    // A value holding the bytes 01 and 41: the 01 is escaped.
+    var out: telnetwire.TelBuf = Vec.new()
+    test.assert_eq(telnetopt.environ_begin(var out, telnetopt.TEL_SEND), true)
+    test.assert_eq(telnetopt.environ_item(var out, telnetopt.TEL_ENV_USERVAR, "\u{1}A"), true)
+    test.assert_eq(list_of(var out), [0xFF, 0xFA, 0x27, 0x01, 0x03, 0x02, 0x01, 0x41])
+
+@test
+fn test_every_builder_leaves_a_buffer_that_is_too_full_as_it_was() [io]
+    var a = nearly_full(5)
+    test.assert_eq(telnetopt.ttype_send(var a), false)
+    test.assert_eq(a.len(), telnetwire.TEL_BUF_MAX - 5)
+    var b = nearly_full(8)
+    test.assert_eq(telnetopt.ttype_is(var b, "VT100"), false)
+    test.assert_eq(b.len(), telnetwire.TEL_BUF_MAX - 8)
+    var name: Vec[u8; 40] = Vec.new()
+    let _ = name.push(65)
+    var c = nearly_full(6)
+    test.assert_eq(telnetopt.ttype_is_bytes(var c, var name), false)
+    test.assert_eq(c.len(), telnetwire.TEL_BUF_MAX - 6)
+    var d = nearly_full(5)
+    test.assert_eq(telnetopt.tspeed_send(var d), false)
+    var e = nearly_full(14)
+    test.assert_eq(telnetopt.tspeed_is(var e, 38400, 9600), false)
+    test.assert_eq(e.len(), telnetwire.TEL_BUF_MAX - 14)
+    var f = nearly_full(8)
+    test.assert_eq(telnetopt.naws(var f, 80, 24), false)
+    test.assert_eq(f.len(), telnetwire.TEL_BUF_MAX - 8)
+    var g = nearly_full(3)
+    test.assert_eq(telnetopt.environ_begin(var g, telnetopt.TEL_IS), false)
+    test.assert_eq(g.len(), telnetwire.TEL_BUF_MAX - 3)
+    var h = nearly_full(1)
+    test.assert_eq(telnetopt.environ_item(var h, telnetopt.TEL_ENV_VAR, "USER"), false)
+    test.assert_eq(h.len(), telnetwire.TEL_BUF_MAX - 1)
+
+@test
+fn test_the_naws_readers() [io]
+    var sub = sub_of([0x01, 0x50, 0x00, 0x18])
+    test.assert_eq(telnetopt.sb_naws_cols(var sub), 336)
+    test.assert_eq(telnetopt.sb_naws_rows(var sub), 24)
+    var short = sub_of([0x01, 0x50, 0x00])
+    test.assert_eq(telnetopt.sb_naws_cols(var short), -1)
+    test.assert_eq(telnetopt.sb_naws_rows(var short), -1)
+
+@test
+fn test_the_terminal_speed_readers() [io]
+    var sub = sub_of([0, 0x33, 0x38, 0x34, 0x30, 0x30, 0x2C, 0x39, 0x36, 0x30, 0x30])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var sub), 38400)
+    test.assert_eq(telnetopt.sb_tspeed_rx(var sub), 9600)
+
+@test
+fn test_terminal_speed_text_that_is_not_two_numbers_is_refused() [io]
+    // No comma, an empty side, a letter, a second comma, and a SEND.
+    var a = sub_of([0, 0x39, 0x36])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var a), -1)
+    test.assert_eq(telnetopt.sb_tspeed_rx(var a), -1)
+    var b = sub_of([0, 0x2C, 0x39])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var b), -1)
+    var c = sub_of([0, 0x39, 0x2C])
+    test.assert_eq(telnetopt.sb_tspeed_rx(var c), -1)
+    var d = sub_of([0, 0x39, 0x61, 0x2C, 0x39])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var d), -1)
+    var e = sub_of([0, 0x39, 0x2C, 0x39, 0x2C, 0x39])
+    test.assert_eq(telnetopt.sb_tspeed_rx(var e), -1)
+    var f = sub_of([0, 0x39, 0x2C, 0x39, 0x61])
+    test.assert_eq(telnetopt.sb_tspeed_rx(var f), -1)
+    var g = sub_of([1, 0x39, 0x2C, 0x39])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var g), -1)
+    test.assert_eq(telnetopt.sb_tspeed_rx(var g), -1)
+    var empty = sub_of([])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var empty), -1)
+
+@test
+fn test_a_long_speed_is_cut_after_nine_digits() [io]
+    var sub = sub_of([0, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x2C, 0x31])
+    test.assert_eq(telnetopt.sb_tspeed_tx(var sub), 123456789)
+    var rx = sub_of([0, 0x31, 0x2C, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30])
+    test.assert_eq(telnetopt.sb_tspeed_rx(var rx), 123456789)
+
+@test
+fn test_the_terminal_name_reader() [io]
+    var sub = sub_of([0, 0x56, 0x54, 0x31, 0x30, 0x30])
+    var name: Vec[u8; 40] = Vec.new()
+    test.assert_eq(telnetopt.sb_ttype_name(var sub, var name), 5)
+    test.assert_eq(name[0], 0x56)
+    // A SEND is not a name, and the buffer is emptied.
+    var send = sub_of([1])
+    test.assert_eq(telnetopt.sb_ttype_name(var send, var name), -1)
+    test.assert_eq(name.len(), 0)
+    var empty = sub_of([])
+    test.assert_eq(telnetopt.sb_ttype_name(var empty, var name), -1)
+
+@test
+fn test_a_terminal_name_longer_than_the_buffer_is_cut() [io]
+    var sub = sub_of([0])
+    for _i in 0..60
+        let _ = sub.push(0x41)
+    var name: Vec[u8; 40] = Vec.new()
+    test.assert_eq(telnetopt.sb_ttype_name(var sub, var name), 40)
+
+// A NEW-ENVIRON IS: VAR "USER" VALUE "kim" USERVAR "X" with a text of 01 41.
+fn environ_sub() -> telnetwire.TelSb
+    sub_of([0, 0, 0x55, 0x53, 0x45, 0x52, 1, 0x6B, 0x69, 0x6D, 3, 0x58, 1, 2, 1, 0x41])
+
+@test
+fn test_the_environment_walk() [io]
+    var sub = environ_sub()
+    var it = telnetopt.environ_iter()
+    var kinds: [Int] = []
+    var lens: [Int] = []
+    for _i in 0..10
+        if telnetopt.environ_next(var sub, var it)
+            list.push(kinds, it.kind)
+            list.push(lens, it.len)
+    test.assert_eq(kinds, [0, 1, 3, 1])
+    test.assert_eq(lens, [4, 3, 1, 3])
+
+@test
+fn test_the_environment_text_has_its_escapes_removed() [io]
+    var sub = environ_sub()
+    var it = telnetopt.environ_iter()
+    var text: Vec[u8; 40] = Vec.new()
+    for _i in 0..3
+        let _ = telnetopt.environ_next(var sub, var it)
+    // The fourth item is VALUE ESC 01 41: two bytes of text, 01 and 41.
+    test.assert_eq(telnetopt.environ_next(var sub, var it), true)
+    test.assert_eq(telnetopt.environ_text(var sub, it, var text), 2)
+    test.assert_eq(text[0], 1)
+    test.assert_eq(text[1], 0x41)
+
+@test
+fn test_the_walk_skips_bytes_before_the_first_kind_and_ends() [io]
+    var sub = sub_of([2, 0x41, 0x42])
+    var it = telnetopt.environ_iter()
+    test.assert_eq(telnetopt.environ_next(var sub, var it), false)
+    var empty = sub_of([2])
+    var it2 = telnetopt.environ_iter()
+    test.assert_eq(telnetopt.environ_next(var empty, var it2), false)
+
+@test
+fn test_an_escape_at_the_very_end_is_part_of_the_text() [io]
+    var sub = sub_of([0, 0, 0x41, 2])
+    var it = telnetopt.environ_iter()
+    test.assert_eq(telnetopt.environ_next(var sub, var it), true)
+    test.assert_eq(it.len, 2)
+    var text: Vec[u8; 40] = Vec.new()
+    test.assert_eq(telnetopt.environ_text(var sub, it, var text), 2)
+    test.assert_eq(text[1], 2)
